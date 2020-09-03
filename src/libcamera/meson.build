@@ -100,12 +100,14 @@ gen_version = meson.source_root() / 'utils' / 'gen-version.sh'
 
 # Use vcs_tag() and not configure_file() or run_command(), to ensure that the
 # version gets updated with every ninja build and not just at meson setup time.
-version_cpp = vcs_tag(command : [gen_version, meson.build_root(), meson.source_root()],
-                      input : 'version.cpp.in',
-                      output : 'version.cpp',
-                      fallback : meson.project_version())
+#version_cpp = vcs_tag(command : [gen_version, meson.build_root()],
+#                      input : 'version.cpp.in',
+#                      output : 'version.cpp',
+#                      fallback : meson.project_version())
+#
+#libcamera_sources += version_cpp
 
-libcamera_sources += version_cpp
+libcamera_sources += files('version_static.cpp')
 
 if ipa_sign_module
     ipa_pub_key_cpp = custom_target('ipa_pub_key_cpp',
