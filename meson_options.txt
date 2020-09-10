@@ -39,7 +39,7 @@ option('lc-compliance',
 option('pipelines',
         type : 'array',
         choices : ['ipu3', 'raspberrypi', 'rkisp1', 'simple', 'uvcvideo', 'vimc'],
-        value : ['simple', 'uvcvideo', 'vimc'],
+        value : ['simple', 'uvcvideo', 'vimc', 'raspberrypi'],
         description : 'Select which pipeline handlers to include')
 
 option('qcam',
@@ -61,3 +61,8 @@ option('v4l2',
         type : 'boolean',
         value : false,
         description : 'Compile the V4L2 compatibility layer')
+
+option('pycamera',
+        type : 'feature',
+        value : 'auto',
+        description : 'Enable libcamera Python bindings')
