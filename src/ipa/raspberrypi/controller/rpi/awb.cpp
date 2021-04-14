@@ -41,16 +41,20 @@ static void read_ct_curve(Pwl &ct_r, Pwl &ct_b,
 {
 	int num = 0;
 	for (auto it = params.begin(); it != params.end(); it++) {
-		double ct = it->second.get_value<double>();
-		assert(it == params.begin() || ct != ct_r.Domain().end);
+		double k = it->second.get_value<double>();
+		if (k <= 0)
+			throw std::runtime_error(
+				"AwbConfig: invalid colour temperature");
+		double m = kelvin_to_mireds(k);
+		assert(it == params.begin() || m != ct_r.Domain().start);
 		if (++it == params.end())
 			throw std::runtime_error(
 				"AwbConfig: incomplete CT curve entry");
-		ct_r.Append(ct, it->second.get_value<double>());
+		ct_r.Prepend(m, it->second.get_value<double>());
 		if (++it == params.end())
 			throw std::runtime_error(
 				"AwbConfig: incomplete CT curve entry");
-		ct_b.Append(ct, it->second.get_value<double>());
+		ct_b.Prepend(m, it->second.get_value<double>());
 		num++;
 	}
 	if (num < 2)
@@ -156,12 +160,11 @@ void Awb::Initialise()
 	// just in case the first few frames don't have anything meaningful in
 	// them.
 	if (!config_.ct_r.Empty() && !config_.ct_b.Empty()) {
-		sync_results_.temperature_K = config_.ct_r.Domain().Clip(4000);
-		sync_results_.gain_r =
-			1.0 / config_.ct_r.Eval(sync_results_.temperature_K);
+		double m = config_.ct_r.Domain().Clip(kelvin_to_mireds(4000));
+		sync_results_.temperature_K = mireds_to_kelvin(m);
+		sync_results_.gain_r = 1.0 / config_.ct_r.Eval(m);
 		sync_results_.gain_g = 1.0;
-		sync_results_.gain_b =
-			1.0 / config_.ct_b.Eval(sync_results_.temperature_K);
+		sync_results_.gain_b = 1.0 / config_.ct_b.Eval(m);
 	} else {
 		// random values just to stop the world blowing up
 		sync_results_.temperature_K = 4500;
@@ -209,9 +212,9 @@ void Awb::SwitchMode([[maybe_unused]] CameraMode const &camera_mode,
 	if (!isAutoEnabled() && first_switch_mode_ && config_.bayes) {
 		Pwl ct_r_inverse = config_.ct_r.Inverse();
 		Pwl ct_b_inverse = config_.ct_b.Inverse();
-		double ct_r = ct_r_inverse.Eval(ct_r_inverse.Domain().Clip(1 / manual_r_));
-		double ct_b = ct_b_inverse.Eval(ct_b_inverse.Domain().Clip(1 / manual_b_));
-		prev_sync_results_.temperature_K = (ct_r + ct_b) / 2;
+		double m_r = ct_r_inverse.Eval(ct_r_inverse.Domain().Clip(1 / manual_r_));
+		double m_b = ct_b_inverse.Eval(ct_b_inverse.Domain().Clip(1 / manual_b_));
+		prev_sync_results_.temperature_K = mireds_to_kelvin((m_r + m_b) / 2);
 		sync_results_.temperature_K = prev_sync_results_.temperature_K;
 	}
 	// Let other algorithms know the current white balance values.
@@ -273,6 +276,8 @@ void Awb::Prepare(Metadata *image_metadata)
 			fetchAsyncResults();
 	}
 	// Finally apply IIR filter to results and put into metadata.
+	// We're intpolating gains here, not normalised colours, which
+	// we can do directly against the colour temperature.
 	memcpy(prev_sync_results_.mode, sync_results_.mode,
 	       sizeof(prev_sync_results_.mode));
 	prev_sync_results_.temperature_K =
@@ -430,66 +435,67 @@ double Awb::coarseSearch(Pwl const &prior)
 {
 	points_.clear(); // assume doesn't deallocate memory
 	size_t best_point = 0;
-	double t = mode_->ct_lo;
+	double m = kelvin_to_mireds(mode_->ct_hi);
+	double m_hi = kelvin_to_mireds(mode_->ct_lo);
 	int span_r = 0, span_b = 0;
 	// Step down the CT curve evaluating log likelihood.
 	while (true) {
-		double r = config_.ct_r.Eval(t, &span_r);
-		double b = config_.ct_b.Eval(t, &span_b);
+		double r = config_.ct_r.Eval(m, &span_r);
+		double b = config_.ct_b.Eval(m, &span_b);
 		double gain_r = 1 / r, gain_b = 1 / b;
 		double delta2_sum = computeDelta2Sum(gain_r, gain_b);
 		double prior_log_likelihood =
-			prior.Eval(prior.Domain().Clip(t));
+			prior.Eval(prior.Domain().Clip(m));
 		double final_log_likelihood = delta2_sum - prior_log_likelihood;
 		LOG(RPiAwb, Debug)
-			<< "t: " << t << " gain_r " << gain_r << " gain_b "
+			<< "t: " << mireds_to_kelvin(m) << " (m " << m << ") "
+			<< " gain_r " << gain_r << " gain_b "
 			<< gain_b << " delta2_sum " << delta2_sum
 			<< " prior " << prior_log_likelihood << " final "
 			<< final_log_likelihood;
-		points_.push_back(Pwl::Point(t, final_log_likelihood));
+		points_.push_back(Pwl::Point(m, final_log_likelihood));
 		if (points_.back().y < points_[best_point].y)
 			best_point = points_.size() - 1;
-		if (t == mode_->ct_hi)
+		if (m == m_hi)
 			break;
 		// for even steps along the r/b curve scale them by the current t
-		t = std::min(t + t / 10 * config_.coarse_step,
-			     mode_->ct_hi);
+		m = std::min(m + 25 * config_.coarse_step, m_hi);
 	}
-	t = points_[best_point].x;
-	LOG(RPiAwb, Debug) << "Coarse search found CT " << t;
+	m = points_[best_point].x;
+	LOG(RPiAwb, Debug) << "Coarse search found CT " << mireds_to_kelvin(m);
 	// We have the best point of the search, but refine it with a quadratic
 	// interpolation around its neighbours.
 	if (points_.size() > 2) {
 		unsigned long bp = std::min(best_point, points_.size() - 2);
 		best_point = std::max(1UL, bp);
-		t = interpolate_quadatric(points_[best_point - 1],
+		m = interpolate_quadatric(points_[best_point - 1],
 					  points_[best_point],
 					  points_[best_point + 1]);
 		LOG(RPiAwb, Debug)
 			<< "After quadratic refinement, coarse search has CT "
-			<< t;
+			<< mireds_to_kelvin(m);
 	}
-	return t;
+	return m;
 }
 
-void Awb::fineSearch(double &t, double &r, double &b, Pwl const &prior)
+void Awb::fineSearch(double &m, double &r, double &b, Pwl const &prior)
 {
 	int span_r = -1, span_b = -1;
-	config_.ct_r.Eval(t, &span_r);
-	config_.ct_b.Eval(t, &span_b);
-	double step = t / 10 * config_.coarse_step * 0.1;
+	config_.ct_r.Eval(m, &span_r);
+	config_.ct_b.Eval(m, &span_b);
+	double step = 5 * config_.coarse_step;
 	int nsteps = 5;
-	double r_diff = config_.ct_r.Eval(t + nsteps * step, &span_r) -
-			config_.ct_r.Eval(t - nsteps * step, &span_r);
-	double b_diff = config_.ct_b.Eval(t + nsteps * step, &span_b) -
-			config_.ct_b.Eval(t - nsteps * step, &span_b);
+	double r_diff = config_.ct_r.Eval(m + nsteps * step, &span_r) -
+			config_.ct_r.Eval(m - nsteps * step, &span_r);
+	double b_diff = config_.ct_b.Eval(m + nsteps * step, &span_b) -
+			config_.ct_b.Eval(m - nsteps * step, &span_b);
 	Pwl::Point transverse(b_diff, -r_diff);
 	if (transverse.Len2() < 1e-6)
 		return;
 	// unit vector orthogonal to the b vs. r function (pointing outwards
 	// with r and b increasing)
 	transverse = transverse / transverse.Len();
-	double best_log_likelihood = 0, best_t = 0, best_r = 0, best_b = 0;
+	double best_log_likelihood = 0, best_m = 0, best_r = 0, best_b = 0;
 	double transverse_range =
 		config_.transverse_neg + config_.transverse_pos;
 	const int MAX_NUM_DELTAS = 12;
@@ -501,11 +507,11 @@ void Awb::fineSearch(double &t, double &r, double &b, Pwl const &prior)
 	// large.
 	nsteps += num_deltas;
 	for (int i = -nsteps; i <= nsteps; i++) {
-		double t_test = t + i * step;
+		double m_test = m + i * step;
 		double prior_log_likelihood =
-			prior.Eval(prior.Domain().Clip(t_test));
-		double r_curve = config_.ct_r.Eval(t_test, &span_r);
-		double b_curve = config_.ct_b.Eval(t_test, &span_b);
+			prior.Eval(prior.Domain().Clip(m_test));
+		double r_curve = config_.ct_r.Eval(m_test, &span_r);
+		double b_curve = config_.ct_b.Eval(m_test, &span_b);
 		// x will be distance off the curve, y the log likelihood there
 		Pwl::Point points[MAX_NUM_DELTAS];
 		int best_point = 0;
@@ -520,7 +526,8 @@ void Awb::fineSearch(double &t, double &r, double &b, Pwl const &prior)
 			double delta2_sum = computeDelta2Sum(gain_r, gain_b);
 			points[j].y = delta2_sum - prior_log_likelihood;
 			LOG(RPiAwb, Debug)
-				<< "At t " << t_test << " r " << r_test << " b "
+				<< "At t " << mireds_to_kelvin(m_test)
+				<< " r " << r_test << " b "
 				<< b_test << ": " << points[j].y;
 			if (points[j].y < points[best_point].y)
 				best_point = j;
@@ -539,17 +546,18 @@ void Awb::fineSearch(double &t, double &r, double &b, Pwl const &prior)
 		double delta2_sum = computeDelta2Sum(gain_r, gain_b);
 		double final_log_likelihood = delta2_sum - prior_log_likelihood;
 		LOG(RPiAwb, Debug)
-			<< "Finally "
-			<< t_test << " r " << r_test << " b " << b_test << ": "
+			<< "Finally " << mireds_to_kelvin(m_test)
+			<< " r " << r_test << " b " << b_test << ": "
 			<< final_log_likelihood
 			<< (final_log_likelihood < best_log_likelihood ? " BEST" : "");
-		if (best_t == 0 || final_log_likelihood < best_log_likelihood)
+		if (best_m == 0 || final_log_likelihood < best_log_likelihood)
 			best_log_likelihood = final_log_likelihood,
-			best_t = t_test, best_r = r_test, best_b = b_test;
+			best_m = m_test, best_r = r_test, best_b = b_test;
 	}
-	t = best_t, r = best_r, b = best_b;
+	m = best_m, r = best_r, b = best_b;
 	LOG(RPiAwb, Debug)
-		<< "Fine search found t " << t << " r " << r << " b " << b;
+		<< "Fine search found t " << mireds_to_kelvin(m)
+		<< " r " << r << " b " << b;
 }
 
 void Awb::awbBayes()
@@ -565,9 +573,9 @@ void Awb::awbBayes()
 	prior.Map([](double x, double y) {
 		LOG(RPiAwb, Debug) << "(" << x << "," << y << ")";
 	});
-	double t = coarseSearch(prior);
-	double r = config_.ct_r.Eval(t);
-	double b = config_.ct_b.Eval(t);
+	double m = coarseSearch(prior);
+	double r = config_.ct_r.Eval(m);
+	double b = config_.ct_b.Eval(m);
 	LOG(RPiAwb, Debug)
 		<< "After coarse search: r " << r << " b " << b << " (gains r "
 		<< 1 / r << " b " << 1 / b << ")";
@@ -577,14 +585,14 @@ void Awb::awbBayes()
 	// there may be more or less green light, this may prove beneficial,
 	// though I probably need more real datasets before deciding exactly how
 	// this should be controlled and tuned.
-	fineSearch(t, r, b, prior);
+	fineSearch(m, r, b, prior);
 	LOG(RPiAwb, Debug)
 		<< "After fine search: r " << r << " b " << b << " (gains r "
 		<< 1 / r << " b " << 1 / b << ")";
 	// Write results out for the main thread to pick up. Remember to adjust
 	// the gains from the ones that the "canonical sensor" would require to
 	// the ones needed by *this* sensor.
-	async_results_.temperature_K = t;
+	async_results_.temperature_K = mireds_to_kelvin(m);
 	async_results_.gain_r = 1.0 / r * config_.sensitivity_r;
 	async_results_.gain_g = 1.0;
 	async_results_.gain_b = 1.0 / b * config_.sensitivity_b;

@@ -48,6 +48,20 @@ private:
 	bool paused_;
 };
 
+// Other functions that might be generally useful to algorithms.
+
+// Convert from colour temperature (in Kelvin) to mireds, and vice versa.
+
+static inline double kelvin_to_mireds(double k)
+{
+	return 1000000.0 / k;
+}
+
+static inline double mireds_to_kelvin(double m)
+{
+	return 1000000.0 / m;
+}
+
 // This code is for automatic registration of Front End algorithms with the
 // system.
 
