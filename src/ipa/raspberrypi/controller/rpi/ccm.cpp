@@ -103,8 +103,12 @@ Matrix calculate_ccm(std::vector<CtCcm> const &ccms, double ct)
 		int i = 0;
 		for (; ct > ccms[i].ct; i++)
 			;
-		double lambda =
-			(ct - ccms[i - 1].ct) / (ccms[i].ct - ccms[i - 1].ct);
+		// Interpolating colour matrices works slightly better if we do it
+		// against the reciprocal of the colour temperature (mireds).
+		double m = kelvin_to_mireds(ct);
+		double m0 = kelvin_to_mireds(ccms[i - 1].ct);
+		double m1 = kelvin_to_mireds(ccms[i].ct);
+		double lambda = (m0 - m) / (m0 - m1);
 		return lambda * ccms[i].ccm + (1.0 - lambda) * ccms[i - 1].ccm;
 	}
 }
