@@ -413,6 +413,8 @@ void get_cal_table(double ct, std::vector<AlscCalibration> const &calibrations,
 		LOG(RPiAlsc, Debug)
 			<< "ct is " << ct << ", interpolating between "
 			<< ct0 << " and " << ct1;
+		// We're interpolating gains here, not colours, so using
+		// the CT directly in kelvins (not mireds) is reasonable.
 		for (int i = 0; i < XY; i++)
 			cal_table[i] =
 				(calibrations[idx].table[i] * (ct1 - ct) +
