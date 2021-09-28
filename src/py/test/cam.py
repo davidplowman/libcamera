@@ -373,7 +373,7 @@ def main():
 	parser = argparse.ArgumentParser()
 	# global options
 	parser.add_argument("-l", "--list", action="store_true", help="List all cameras")
-	parser.add_argument("-c", "--camera", type=int, action="extend", nargs=1, default=[], help="Specify which camera to operate on, by by index")
+	parser.add_argument("-c", "--camera", type=int, action="append", default=[], help="Specify which camera to operate on, by by index")
 	parser.add_argument("-p", "--list-properties", action="store_true", help="List cameras properties")
 	parser.add_argument("--list-controls", action="store_true", help="List cameras controls")
 	parser.add_argument("-I", "--info", action="store_true", help="Display information about stream(s)")
