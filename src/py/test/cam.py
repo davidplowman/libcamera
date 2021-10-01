@@ -233,7 +233,7 @@ def create_requests(ctx):
 				print("Can't set buffer for request")
 				exit(-1)
 
-			requests.append(request)
+		requests.append(request)
 
 	ctx["requests"] = requests
 
@@ -319,11 +319,11 @@ def request_handler(state, ctx, req):
 
 		meta = fb.metadata
 
-		print("{:.6f} ({:.2f} fps) {}-{}: seq {}, bytes {}, CRCs {}"
-			  .format(ts / 1000000000, fps,
-					  ctx["id"], stream_name,
-					  meta.sequence, meta.bytesused,
-					  crcs))
+		#print("{:.6f} ({:.2f} fps) {}-{}: seq {}, bytes {}, CRCs {}"
+		#	  .format(ts / 1000000000, fps,
+		#			  ctx["id"], stream_name,
+		#			  meta.sequence, meta.bytesused,
+		#			  crcs))
 
 		if ctx["opt-metadata"]:
 			reqmeta = req.metadata

@@ -367,19 +367,19 @@ class MainWindow(QtGui.QWindow):
 
 		self.reqqueue.append(req)
 		#self.update()
-		print("REQ UPDATE")
+		#print("REQ UPDATE")
 		self.requestUpdate()
 
 	def event(self, event):
 		if event.type() == QEvent.UpdateRequest:
-			print("UpdateRequest")
+			#print("UpdateRequest")
 			self.renderNow()
 			return True
 		else:
 			return super().event(event)
 
 	def renderNow(self):
-		print("render now")
+		#print("render now")
 		if not self.isExposed():
 				return
 
