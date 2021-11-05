@@ -25,6 +25,27 @@ namespace py = pybind11;
 using namespace std;
 using namespace libcamera;
 
+template<typename T>
+static py::object ValueOrTuple(const ControlValue &cv)
+{
+	if (cv.isArray()) {
+		const T *v = reinterpret_cast<const T *>(cv.data().data());
+		switch (cv.numElements()) {
+		case 0:
+			return py::make_tuple();
+		case 1:
+			return py::make_tuple(v[0]);
+		case 2:
+			return py::make_tuple(v[0], v[1]);
+		case 3:
+			return py::make_tuple(v[0], v[1], v[2]);
+		default:
+			return py::make_tuple(v[0], v[1], v[2], v[3]);
+		}
+	}
+	return py::cast(cv.get<T>());
+}
+
 static py::object ControlValueToPy(const ControlValue &cv)
 {
 	//assert(!cv.isArray());
@@ -32,15 +53,15 @@ static py::object ControlValueToPy(const ControlValue &cv)
 
 	switch (cv.type()) {
 	case ControlTypeBool:
-		return py::cast(cv.get<bool>());
+		return ValueOrTuple<bool>(cv);
 	case ControlTypeByte:
-		return py::cast(cv.get<uint8_t>());
+		return ValueOrTuple<uint8_t>(cv);
 	case ControlTypeInteger32:
-		return py::cast(cv.get<int32_t>());
+		return ValueOrTuple<int32_t>(cv);
 	case ControlTypeInteger64:
-		return py::cast(cv.get<int64_t>());
+		return ValueOrTuple<int64_t>(cv);
 	case ControlTypeFloat:
-		return py::cast(cv.get<float>());
+		return ValueOrTuple<float>(cv);
 	case ControlTypeString:
 		return py::cast(cv.get<string>());
 	case ControlTypeRectangle: {
