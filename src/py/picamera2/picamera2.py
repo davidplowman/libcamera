@@ -254,19 +254,22 @@ class Picamera2:
         return {"format": stream.fmt, "frame_size": stream.frameSize, "size": stream.size,
                 "stride": stream.stride}
 
-    def start_(self):
+    def list_controls(self):
+        return self.camera.controls
+
+    def start_(self, controls={}):
         if self.started:
             raise RuntimeError("Camera already started")
         self.started = True
-        self.camera.start()
+        self.camera.start(controls)
         for request in self.make_requests():
             self.camera.queueRequest(request)
         if self.verbose:
             print("Camera started")
 
-    def start(self):
+    def start(self, controls={}):
         """Start the camera system running."""
-        self.start_()
+        self.start_(controls)
 
     def stop_(self, request=None):
         self.camera.stop()
