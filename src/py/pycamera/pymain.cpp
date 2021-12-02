@@ -319,6 +319,7 @@ PYBIND11_MODULE(pycamera, m)
 		.def("at", py::overload_cast<unsigned int>(&CameraConfiguration::at), py::return_value_policy::reference_internal)
 		.def_property_readonly("size", &CameraConfiguration::size)
 		.def_property_readonly("empty", &CameraConfiguration::empty)
+		.def_readwrite("transform", &CameraConfiguration::transform)
 		;
 
 	py::class_<StreamConfiguration>(m, "StreamConfiguration")
@@ -462,5 +463,64 @@ PYBIND11_MODULE(pycamera, m)
 			v.resize(self.planes().size());
 			transform(self.planes().begin(), self.planes().end(), v.begin(), [](const auto &p) { return p.bytesused; });
 			return v;
+		});
+
+	py::class_<Transform>(m, "Transform")
+		.def(py::init([]() { return Transform::Identity; }))
+		.def(py::init([](int hflip, int vflip, int transpose) {
+			Transform t = Transform::Identity;
+			if (hflip)
+				t |= Transform::HFlip;
+			if (vflip)
+				t |= Transform::VFlip;
+			if (transpose)
+				t |= Transform::Transpose;
+			return t;
+		}))
+		.def(py::init([](int rotation) {
+			return transformFromRotation(rotation);
+		}))
+		.def(py::init([](Transform &other) { return other; }))
+		.def("__repr__", [](Transform &self) {
+			return "<pycamera.Transform '" + std::string(transformToString(self)) + "'>";
+		})
+		.def_property("hflip",
+			      [](Transform &self) {
+				      return !!(self & Transform::HFlip);
+			      },
+			      [](Transform &self, int hflip) {
+				      if (hflip)
+					      self |= Transform::HFlip;
+				      else
+					      self &= ~Transform::HFlip;
+			      })
+		.def_property("vflip",
+			      [](Transform &self) {
+				      return !!(self & Transform::VFlip);
+			      },
+			      [](Transform &self, int vflip) {
+				      if (vflip)
+					      self |= Transform::VFlip;
+				      else
+					      self &= ~Transform::VFlip;
+			      })
+		.def_property("transpose",
+			      [](Transform &self) {
+				      return !!(self & Transform::Transpose);
+			      },
+			      [](Transform &self, int transpose) {
+				      if (transpose)
+					      self |= Transform::Transpose;
+				      else
+					      self &= ~Transform::Transpose;
+			      })
+		.def("inverse", [](Transform &self) { return -self; })
+		.def("invert", [](Transform &self) {
+			self = -self;
+			return py::none();
+		})
+		.def("compose", [](Transform &self, Transform &other) {
+			self = self * other;
+			return py::none();
 		});
 }
