@@ -8,9 +8,12 @@ picam2 = Picamera2()
 preview = QtPreview(picam2)
 picam2.open_camera()
 
-picam2.configure(picam2.generate_configuration({"role": "preview"}))
+preview_config = picam2.generate_configuration({"role": "preview"})
+preview_config["transform"] = pylibcamera.Transform(180)
+picam2.configure(preview_config)
 picam2.start()
 
 time.sleep(2)
 capture_config = picam2.generate_configuration({"role": "still"})
+capture_config["transform"] = pylibcamera.Transform(180)
 picam2.switch_mode_and_capture("test.jpg", capture_config)

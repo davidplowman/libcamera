@@ -78,8 +78,9 @@ class Picamera2:
 
     def lc_camera_config_to_python(self, camera_config, lc_camera_config):
         # Turn a libcamera camera config object into a Python-ified one.
-        return [self.lc_stream_config_to_python(stream_config, lc_stream_config)
-                for stream_config, lc_stream_config in zip(camera_config, lc_camera_config)]
+        stream_configs = [self.lc_stream_config_to_python(stream_config, lc_stream_config)
+                          for stream_config, lc_stream_config in zip(camera_config["streams"], lc_camera_config)]
+        return {"transform": lc_camera_config.transform, "streams": stream_configs}
 
     def lc_stream_config_to_python(self, stream_config, lc_stream_config):
         # Turn a libcamera stream config to a Python-ified one.
@@ -89,6 +90,7 @@ class Picamera2:
                 "buffer_count": lc_stream_config.bufferCount}
 
     def generate_configuration_(self, camera_config):
+        print("generate_configuration:", camera_config)
         return self.lc_camera_config_to_python(camera_config,
                                                self.python_to_lc_camera_config(camera_config))
 
@@ -114,7 +116,7 @@ class Picamera2:
         # no larger than stream1 and YUV.
         stream1 = None
         stream2 = None
-        for stream_config in camera_config:
+        for stream_config in camera_config["streams"]:
             if stream_config["role"] == "raw":
                 raw_stream = stream_config
             else:
@@ -143,12 +145,18 @@ class Picamera2:
         if stream1:
             stream1["format"] = "BGR888"
 
+        print("massage_configuration out:", camera_config)
         return camera_config
 
     def generate_configuration(self, camera_config):
         """Generate a camera configuration according to the given specification."""
-        if not isinstance(camera_config, list):
-            camera_config = [camera_config]
+        if isinstance(camera_config, dict):
+            if "streams" not in camera_config:
+                camera_config = {"transform": pylibcamera.Transform(), "streams": [camera_config]}
+        elif isinstance(camera_config, list):
+            camera_config = {"transform": pylibcamera.Transform(), "streams": camera_config}
+        else:
+            raise RuntimeError("Invalid camera configuration")
         return self.massage_configuration(self.generate_configuration_(camera_config))
 
     def python_to_lc_camera_config(self, camera_config):
@@ -159,8 +167,9 @@ class Picamera2:
                  "video": pylibcamera.StreamRole.VideoRecording,
                  "raw": pylibcamera.StreamRole.Raw}
         lc_camera_config = self.camera.generateConfiguration([roles[stream_config["role"].lower()]
-                                                              for stream_config in camera_config])
-        for stream_config, lc_stream_config in zip(camera_config, lc_camera_config):
+                                                              for stream_config in camera_config["streams"]])
+        lc_camera_config.transform = camera_config["transform"]
+        for stream_config, lc_stream_config in zip(camera_config["streams"], lc_camera_config):
             if "format" in stream_config:
                 lc_stream_config.fmt = stream_config["format"]
             if "size" in stream_config:
@@ -189,15 +198,20 @@ class Picamera2:
 
     def find_stream(self, camera_configuration, role):
         # Find a stream matching the given role.
-        for i, stream_config in enumerate(camera_configuration):
+        for i, stream_config in enumerate(camera_configuration["streams"]):
             if stream_config["role"] == role:
                 return i
         return -1 if role == "raw" else 0
 
     def configure_(self, camera_config=[{"role": "preview"}]):
         # Configure the camera system with the given configuration.
-        if not isinstance(camera_config, list):
-            camera_config = [camera_config]
+        if isinstance(camera_config, dict):
+            if "streams" not in camera_config:
+                camera_config = {"transform": pylibcamera.Transform(), "streams": [camera_config]}
+        elif isinstance(camera_config, list):
+            camera_config = {"transform": pylibcamera.Transform(), "streams": camera_config}
+        else:
+            raise RuntimeError("Invalid camera configuration")
         lc_camera_config = self.python_to_lc_camera_config(camera_config)
 
         status = lc_camera_config.validate()
@@ -240,8 +254,10 @@ class Picamera2:
 
         return True if status == pylibcamera.ConfigurationStatus.Adjusted else False
 
-    def configure(self, camera_config=[{"role": "preview"}]):
+    def configure(self, camera_config=None):
         """Configure the camera system with the given configuration."""
+        if camera_config is None:
+            camera_config = {"transform": pylibcamera.Transform(), "streams": [{"role": "preview"}]}
         return self.configure_(camera_config)
 
     def stream_configuration(self, index):
