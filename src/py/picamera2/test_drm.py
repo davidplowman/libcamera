@@ -9,7 +9,7 @@ preview = DrmPreview(picam2)
 picam2.open_camera()
 
 cfg = picam2.generate_configuration({"role": "preview"})
-cfg[0]["format"] = "RGB888"
+cfg["streams"][0]["format"] = "RGB888"
 picam2.configure(cfg)
 
 picam2.start()
