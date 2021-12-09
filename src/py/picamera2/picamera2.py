@@ -107,7 +107,7 @@ class Picamera2:
         return fmt in ("NV21", "NV12", "YUV420", "YVU420", "YVYU", "YUYV", "UYVY", "VYUY")
 
     def is_RGB(self, fmt):
-        return fmt in ("BGR888", "RGB888")
+        return fmt in ("BGR888", "RGB888", "XBGR8888", "XRGB888")
 
     def massage_configuration(self, camera_config):
         # Adjust the camera configuration to be more appropriate to Python users.
@@ -143,7 +143,7 @@ class Picamera2:
         if stream2 and not self.is_YUV(stream2["format"]):
             raise RuntimeError("Second stream must be a YUV format")
         if stream1:
-            stream1["format"] = "BGR888"
+            stream1["format"] = "XRGB8888"
 
         print("massage_configuration out:", camera_config)
         return camera_config
@@ -514,20 +514,33 @@ class CompletedRequest:
         fmt = config["format"]
         w, h = config["size"]
         stride = config["stride"]
-        if fmt == "BGR888":
+        if fmt in ("BGR888", "RGB888"):
             image = array.reshape((h, w, 3))
+        elif fmt in ("XBGR8888", "XRGB8888"):
+            image = array.reshape((h, w, 4))
         elif fmt[0] == 'S': # raw formats
             image = array.reshape((h, stride))
         else:
             raise RuntimeError("Format " + fmt + " not supported")
         return image
 
+    def make_pil_image(self, index):
+        rgb = self.make_image(index)
+        fmt = self.picam2.streams[index].configuration.fmt
+        mode_lookup = {"RGB888": "BGR", "BGR888": "RGB", "XBGR8888": "RGBA", "XRGB8888": "BGRX"}
+        mode = mode_lookup[fmt]
+        pil_img = Image.frombuffer("RGB", (rgb.shape[1], rgb.shape[0]), rgb, "raw", mode, 0, 1)
+        return pil_img
+
     def save(self, index, filename):
         """Save a JPEG or PNG image of the numbered stream's buffer in this completed request."""
         # This is probably a hideously expensive way to do a capture.
         start_time = time.time()
-        image_data = self.make_image(index)
-        img = Image.frombuffer("RGB", (image_data.shape[1], image_data.shape[0]), image_data, "raw", "RGB", 0, 1)
+        img = self.make_pil_image(index)
+        if img.mode == "RGBA":
+            # Nasty hack. Qt doesn't understand RGBX so we have to use RGBA. But saving a JPEG
+            # doesn't like RGBA to we have to bodge that to RGBX.
+            img.mode = "RGBX"
         # compress_level=1 saves pngs much faster, and still gets most of the compression.
         png_compress_level = self.picam2.options.get("compress_level", 1)
         jpeg_quality = self.picam2.options.get("quality", 90)

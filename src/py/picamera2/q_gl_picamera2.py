@@ -153,12 +153,16 @@ class QGlPicamera2(QWidget):
         eglMakeCurrent(self.egl.display, self.surface, self.surface, self.egl.context)
 
     class Buffer:
-        # libcamera format string -> DRM fourcc
+        # libcamera format string -> DRM fourcc, note that 24-bit formats are not supported
         FMT_MAP = {
-            "RGB888": "RG24",
             "XRGB8888": "XR24",
-            "ARGB8888": "AR24",
+            "XBGR8888": "XB24",
             "YUYV": "YUYV",
+            # doesn't work "YVYU": "YVYU",
+            "UYVY": "UYVY",
+            # doesn't work "VYUY": "VYUY",
+            "YUV420": "YU12",
+            "YVU420": "YV12",
         }
 
         def __init__(self, display, completed_request):
@@ -170,15 +174,34 @@ class QGlPicamera2(QWidget):
             fmt = str_to_fourcc(self.FMT_MAP[fmt])
             w, h = cfg.size
 
-            attribs = [
-                EGL_WIDTH, w,
-                EGL_HEIGHT, h,
-                EGL_LINUX_DRM_FOURCC_EXT, fmt,
-                EGL_DMA_BUF_PLANE0_FD_EXT, fb.fd(0),
-                EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-                EGL_DMA_BUF_PLANE0_PITCH_EXT, cfg.stride,
-                EGL_NONE,
-            ]
+            if cfg.fmt in ("YUV420", "YVU420"):
+                h2 = h // 2
+                stride2 = cfg.stride // 2
+                attribs = [
+                    EGL_WIDTH, w,
+                    EGL_HEIGHT, h,
+                    EGL_LINUX_DRM_FOURCC_EXT, fmt,
+                    EGL_DMA_BUF_PLANE0_FD_EXT, fb.fd(0),
+                    EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+                    EGL_DMA_BUF_PLANE0_PITCH_EXT, cfg.stride,
+                    EGL_DMA_BUF_PLANE1_FD_EXT, fb.fd(0),
+                    EGL_DMA_BUF_PLANE1_OFFSET_EXT, h * cfg.stride,
+                    EGL_DMA_BUF_PLANE1_PITCH_EXT, stride2,
+                    EGL_DMA_BUF_PLANE2_FD_EXT, fb.fd(0),
+                    EGL_DMA_BUF_PLANE2_OFFSET_EXT, h * cfg.stride + h2 * stride2,
+                    EGL_DMA_BUF_PLANE2_PITCH_EXT, stride2,
+                    EGL_NONE,
+                ]
+            else:
+                attribs = [
+                    EGL_WIDTH, w,
+                    EGL_HEIGHT, h,
+                    EGL_LINUX_DRM_FOURCC_EXT, fmt,
+                    EGL_DMA_BUF_PLANE0_FD_EXT, fb.fd(0),
+                    EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+                    EGL_DMA_BUF_PLANE0_PITCH_EXT, cfg.stride,
+                    EGL_NONE,
+                ]
 
             image = eglCreateImageKHR(display,
                                       EGL_NO_CONTEXT,

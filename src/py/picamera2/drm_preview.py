@@ -5,9 +5,13 @@ from null_preview import *
 class DrmPreview(NullPreview):
     FMT_MAP = {
         "RGB888": pykms.PixelFormat.RGB888,
-        "YUYV": pykms.PixelFormat.YUYV,
-        "ARGB8888": pykms.PixelFormat.ARGB8888,
+        "BGR888": pykms.PixelFormat.BGR888,
+        # doesn't work "YUYV": pykms.PixelFormat.YUYV,
+        # doesn't work "YVYU": pykms.PixelFormat.YVYU,
         "XRGB8888": pykms.PixelFormat.XRGB8888,
+        "XBGR8888": pykms.PixelFormat.XBGR8888,
+        "YUV420": pykms.PixelFormat.YUV420,
+        "YVU420": pykms.PixelFormat.YVU420,
     }
 
     def __init__(self, picam2):
@@ -53,7 +57,16 @@ class DrmPreview(NullPreview):
                 assert(self.plane)
             fd = fb.fd(0)
             stride = cfg.stride
-            drmfb = pykms.DmabufFramebuffer(self.card, width, height, fmt, [fd], [stride], [0])
+            if cfg.fmt in ("YUV420", "YVU420"):
+                h2 = height // 2
+                stride2 = stride // 2
+                size = height * stride
+                drmfb = pykms.DmabufFramebuffer(self.card, width, height, fmt,
+                                                [fd, fd, fd],
+                                                [stride, stride2, stride2],
+                                                [0, size, size + h2 * stride2])
+            else:
+                drmfb = pykms.DmabufFramebuffer(self.card, width, height, fmt, [fd], [stride], [0])
             self.drmfbs[fb] = drmfb
             if picam2.verbose:
                 print("Made drm fb", drmfb, "for request", completed_request.request)

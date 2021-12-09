@@ -24,8 +24,7 @@ class QPicamera2(QWidget):
             return
 
         if self.picamera2.preview_stream >= 0:
-            rgb = request.make_image(self.picamera2.preview_stream)
-            img = Image.frombuffer("RGB", (rgb.shape[1], rgb.shape[0]), rgb, "raw", "RGB", 0, 1)
+            img = request.make_pil_image(self.picamera2.preview_stream)
             qim = ImageQt(img).copy()
             pix = QtGui.QPixmap.fromImage(qim)
             self.label.setPixmap(pix)
