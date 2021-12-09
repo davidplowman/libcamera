@@ -387,7 +387,7 @@ PYBIND11_MODULE(pycamera, m)
 		.def(py::init([](vector<tuple<int, unsigned int>> planes, unsigned int cookie) {
 			vector<FrameBuffer::Plane> v;
 			for (const auto& t : planes)
-				v.push_back({FileDescriptor(get<0>(t)), FrameBuffer::Plane::kInvalidOffset, get<1>(t)});
+				v.push_back({SharedFD(get<0>(t)), FrameBuffer::Plane::kInvalidOffset, get<1>(t)});
 			return new FrameBuffer(v, cookie);
 		}))
 		.def_property_readonly("metadata", &FrameBuffer::metadata, py::return_value_policy::reference_internal)
@@ -397,7 +397,7 @@ PYBIND11_MODULE(pycamera, m)
 		})
 		.def("fd", [](FrameBuffer &self, uint32_t idx) {
 			const FrameBuffer::Plane &plane = self.planes()[idx];
-			return plane.fd.fd();
+			return plane.fd.get();
 		})
 		.def_property("cookie", &FrameBuffer::cookie, &FrameBuffer::setCookie);
 
