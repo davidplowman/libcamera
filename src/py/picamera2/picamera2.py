@@ -87,7 +87,8 @@ class Picamera2:
         return {"role": stream_config["role"],
                 "format": lc_stream_config.fmt,
                 "size": lc_stream_config.size,
-                "buffer_count": lc_stream_config.bufferCount}
+                "buffer_count": lc_stream_config.bufferCount,
+                "colour_space": lc_stream_config.colorSpace}
 
     def generate_configuration_(self, camera_config):
         print("generate_configuration:", camera_config)
@@ -176,6 +177,8 @@ class Picamera2:
                 lc_stream_config.size = stream_config["size"]
             if "buffer_count" in stream_config:
                 lc_stream_config.bufferCount = stream_config["buffer_count"]
+            if "colour_space" in stream_config:
+                lc_stream_config.colorSpace = stream_config["colour_space"]
         return lc_camera_config
 
     def make_requests(self):
