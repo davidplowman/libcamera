@@ -466,20 +466,20 @@ PYBIND11_MODULE(pycamera, m)
 		});
 
 	py::class_<Transform>(m, "Transform")
-		.def(py::init([]() { return Transform::Identity; }))
-		.def(py::init([](int hflip, int vflip, int transpose) {
-			Transform t = Transform::Identity;
+		.def(py::init([](int rotation, int hflip, int vflip, int transpose) {
+			Transform t = transformFromRotation(rotation);
 			if (hflip)
-				t |= Transform::HFlip;
+				t ^= Transform::HFlip;
 			if (vflip)
-				t |= Transform::VFlip;
+				t ^= Transform::VFlip;
 			if (transpose)
-				t |= Transform::Transpose;
+				t ^= Transform::Transpose;
 			return t;
-		}))
-		.def(py::init([](int rotation) {
-			return transformFromRotation(rotation);
-		}))
+		}),
+		py::arg("rotation") = 0,
+		py::arg("hflip") = 0,
+		py::arg("vflip") = 0,
+		py::arg("transpose") = 0)
 		.def(py::init([](Transform &other) { return other; }))
 		.def("__repr__", [](Transform &self) {
 			return "<pycamera.Transform '" + std::string(transformToString(self)) + "'>";
