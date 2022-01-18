@@ -1,9 +1,11 @@
 import picamera2
 import selectors
 import threading
+import queue
 import atexit
 import fcntl
 import mmap
+import select
 from v4l2 import *
 
 class H264Encoder():
@@ -19,6 +21,12 @@ class H264Encoder():
         self.idx = 0
         self.vd = open('/dev/video11', 'rb+', buffering=0)
 
+        self.q = queue.Queue()
+
+        self.thread2 = threading.Thread(target=self.thread_poll, args=(self.q,))
+        self.thread2.setDaemon(True)
+        self.thread2.start()
+
         cp = v4l2_capability()
         fcntl.ioctl(self.vd, VIDIOC_QUERYCAP, cp)
         print("Driver:", "".join((chr(c) for c in cp.driver)))
@@ -33,15 +41,15 @@ class H264Encoder():
         fcntl.ioctl(self.vd, VIDIOC_S_CTRL, ctrl)
 
         V4L2_PIX_FMT_H264 = v4l2_fourcc('H', '2', '6', '4')
-        W = 800
-        H = 600
+        W = 1920
+        H = 1080
 
         fmt = v4l2_format()
         fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
         fmt.fmt.pix_mp.width = W
         fmt.fmt.pix_mp.height = H
         fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_YUV420
-        fmt.fmt.pix_mp.plane_fmt[0].bytesperline = 832
+        fmt.fmt.pix_mp.plane_fmt[0].bytesperline = 1920
         fmt.fmt.pix_mp.field = V4L2_FIELD_ANY
         fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_JPEG
         fmt.fmt.pix_mp.num_planes = 1
@@ -67,6 +75,9 @@ class H264Encoder():
         reqbufs.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
         reqbufs.memory = V4L2_MEMORY_DMABUF
         fcntl.ioctl(self.vd, VIDIOC_REQBUFS, reqbufs)
+
+        for i in range(reqbufs.count):
+            self.q.put(i)
 
         reqbufs = v4l2_requestbuffers()
         reqbufs.count = NUM_CAPTURE_BUFFERS
@@ -110,25 +121,54 @@ class H264Encoder():
         atexit.unregister(self.stop)
         picam2.asynchronous = False
 
+    def thread_poll(self, q):
+        pollit = select.poll()
+        pollit.register(self.vd, select.POLLIN)
+        while True:
+            for fd, event in pollit.poll(200):
+                if event & select.POLLIN:
+                    buf = v4l2_buffer()
+                    planes = v4l2_plane * VIDEO_MAX_PLANES
+                    planes = planes()
+                    buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
+                    buf.memory = V4L2_MEMORY_DMABUF
+                    buf.length = 1
+                    buf.m.planes = planes
+                    ret = fcntl.ioctl(self.vd, VIDIOC_DQBUF, buf)
+
+                    if ret == 0:
+                        q.put(buf.index)
+
+                    buf = v4l2_buffer()
+                    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+                    buf.memory = V4L2_MEMORY_MMAP
+                    buf.length = 1
+                    buf.m.planes = planes
+                    ret = fcntl.ioctl(self.vd, VIDIOC_DQBUF, buf)
+
+                    if ret == 0:
+                        print("Wrote")
+                        f1 = open('test.bin','ab')
+                        f1.write(self.bufs[buf.index][0].read()[0:buf.m.planes[0].bytesused])
+                        f1.flush()
+                        f1.close()
+
     def handle_request(self, picam2):
         completed_request = picam2.process_requests()
         stream = picam2.streams[picam2.video_stream]
         cfg = stream.configuration
         width, height = cfg.size
-        
+
         fb = completed_request.request.buffers[stream]
         fd = fb.fd(0)
         stride = cfg.stride
 
         buf = v4l2_buffer()
-        index = self.idx
-        self.idx += 1
-        timestamp_us = 0
+        timestamp_us = fb.metadata.timestamp / 1000
         planes = v4l2_plane * VIDEO_MAX_PLANES
         planes = planes()
-
         buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
-        buf.index = index
+        buf.index = self.q.get()
         buf.field = V4L2_FIELD_NONE
         buf.memory = V4L2_MEMORY_DMABUF
         buf.length = 1
@@ -138,8 +178,9 @@ class H264Encoder():
         buf.m.planes[0].m.fd = fd
         buf.m.planes[0].bytesused = cfg.frameSize
         buf.m.planes[0].length = cfg.frameSize
-        
+
         ret = fcntl.ioctl(self.vd, VIDIOC_QBUF, buf)
+        print("Encode frame")
         completed_request.release()
 
     def stop(self):
