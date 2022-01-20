@@ -102,7 +102,7 @@ class Picamera2:
         if stream_config["format"] in ("YUV420", "YVU420"):
             align = 64
         size = stream_config["size"]
-        stream_config["size"] = (size[0] - size[0] % 32, size[1] - size[1] % 2)
+        stream_config["size"] = (size[0] - size[0] % align, size[1] - size[1] % 2)
 
     def is_YUV(self, fmt):
         return fmt in ("NV21", "NV12", "YUV420", "YVU420", "YVYU", "YUYV", "UYVY", "VYUY")
@@ -146,7 +146,8 @@ class Picamera2:
         if stream1:
             stream1["format"] = "XRGB8888"
 
-        print("massage_configuration out:", camera_config)
+        if self.verbose:
+            print("massage_configuration out:", camera_config)
         return camera_config
 
     def generate_configuration(self, camera_config):
@@ -460,8 +461,16 @@ class Picamera2:
         return True
 
     def make_image(self, index=0, wait=True, signal_function=signal_event):
-        """Make a PIL image from the next frame in the numbered stream."""
+        """Make a 2d image from the next frame in the numbered stream."""
         return self.dispatch_functions([(lambda r: self.make_image_(r, index))], wait, signal_function)
+
+    def make_pil_image_(self, request, index):
+        self.async_result = request.make_pil_image(index)
+        return True
+
+    def make_pil_image(self, index=0, wait=True, signal_function=signal_event):
+        """Make a 2d image from the next frame in the numbered stream."""
+        return self.dispatch_functions([(lambda r: self.make_pil_image_(r, index))], wait, signal_function)
 
 
 class CompletedRequest:
@@ -510,6 +519,11 @@ class CompletedRequest:
         """Fetch the metadata corresponding to this completed request."""
         return self.request.metadata
 
+    def get_info(self, index):
+        config = self.picam2.stream_format(index)
+        w, h = config["size"]
+        return {"width": w, "height": h, "stride": config["stride"], "format": config["format"]}
+
     def make_image(self, index):
         """Make a PIL image from the numbered stream's buffer in this completed request."""
         array = self.make_array(index)
@@ -517,9 +531,19 @@ class CompletedRequest:
         fmt = config["format"]
         w, h = config["size"]
         stride = config["stride"]
+
+        # Turning the 1d array into a 2d image-like array only works if the
+        # image stride (which is in bytes) is a whole number of pixels. Even
+        # then, if they don't match exactly you will get "padding" down the RHS.
+        # Working around this would require another expensive copy of all the data,
+        # but we can think it over whether we want to do that.
         if fmt in ("BGR888", "RGB888"):
+            if stride % 3:
+                raise RuntimeError("Bad width for 3 channel image")
             image = array.reshape((h, w, 3))
         elif fmt in ("XBGR8888", "XRGB8888"):
+            if stride % 4:
+                raise RuntimeError("Bad width for 4 channel image")
             image = array.reshape((h, w, 4))
         elif fmt[0] == 'S': # raw formats
             image = array.reshape((h, stride))
