@@ -19,3 +19,4 @@ h264 = H264Encoder(picam2)
 
 picam2.start()
 time.sleep(10)
+picam2.stop()

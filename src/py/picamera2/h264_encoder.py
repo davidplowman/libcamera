@@ -126,7 +126,8 @@ class H264Encoder():
         f1 = open('test.bin','ab')
         pollit = select.poll()
         pollit.register(self.vd, select.POLLIN)
-        while True:
+
+        while self.running:
             for fd, event in pollit.poll(200):
                 if event & select.POLLIN:
                     buf = v4l2_buffer()
@@ -179,6 +180,9 @@ class H264Encoder():
 
     def handle_request(self, picam2):
         completed_request = picam2.process_requests()
+        if completed_request is None:
+            return
+
         stream = picam2.streams[picam2.video_stream]
         cfg = stream.configuration
         width, height = cfg.size
