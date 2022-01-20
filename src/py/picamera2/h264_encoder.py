@@ -22,6 +22,7 @@ class H264Encoder():
         self.vd = open('/dev/video11', 'rb+', buffering=0)
 
         self.q = queue.Queue()
+        self.q2 = queue.Queue()
 
         self.thread2 = threading.Thread(target=self.thread_poll, args=(self.q,))
         self.thread2.setDaemon(True)
@@ -122,6 +123,7 @@ class H264Encoder():
         picam2.asynchronous = False
 
     def thread_poll(self, q):
+        f1 = open('test.bin','ab')
         pollit = select.poll()
         pollit.register(self.vd, select.POLLIN)
         while True:
@@ -143,15 +145,37 @@ class H264Encoder():
                     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
                     buf.memory = V4L2_MEMORY_MMAP
                     buf.length = 1
+                    ctypes.memset(planes, 0, ctypes.sizeof(v4l2_plane) * VIDEO_MAX_PLANES)
                     buf.m.planes = planes
                     ret = fcntl.ioctl(self.vd, VIDIOC_DQBUF, buf)
 
                     if ret == 0:
-                        print("Wrote")
-                        f1 = open('test.bin','ab')
-                        f1.write(self.bufs[buf.index][0].read()[0:buf.m.planes[0].bytesused])
-                        f1.flush()
-                        f1.close()
+                        bufindex = buf.index
+                        buflen = buf.m.planes[0].length
+
+                        # Write output to file
+                        b = self.bufs[buf.index][0].read(buf.m.planes[0].bytesused)
+                        self.bufs[buf.index][0].seek(0)
+                        f1.write(b)
+
+                        # Requeue encoded buffer
+                        buf = v4l2_buffer()
+                        planes = v4l2_plane * VIDEO_MAX_PLANES
+                        planes = planes()
+                        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+                        buf.memory = V4L2_MEMORY_MMAP
+                        buf.index = bufindex
+                        buf.length = 1
+                        buf.m.planes = planes
+                        buf.m.planes[0].bytesused = 0
+                        buf.m.planes[0].length = buflen
+                        ret = fcntl.ioctl(self.vd, VIDIOC_QBUF, buf)
+
+                        # Release frame from camera
+                        l = self.q2.get()
+                        l.release()
+
+
 
     def handle_request(self, picam2):
         completed_request = picam2.process_requests()
@@ -165,6 +189,8 @@ class H264Encoder():
 
         buf = v4l2_buffer()
         timestamp_us = fb.metadata.timestamp / 1000
+
+        # Pass frame to video 4 linux, to encode
         planes = v4l2_plane * VIDEO_MAX_PLANES
         planes = planes()
         buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
@@ -178,10 +204,8 @@ class H264Encoder():
         buf.m.planes[0].m.fd = fd
         buf.m.planes[0].bytesused = cfg.frameSize
         buf.m.planes[0].length = cfg.frameSize
-
         ret = fcntl.ioctl(self.vd, VIDIOC_QBUF, buf)
-        print("Encode frame")
-        completed_request.release()
+        self.q2.put(completed_request)
 
     def stop(self):
         self.running = False
