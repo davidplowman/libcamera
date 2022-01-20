@@ -21,7 +21,10 @@ class NullPreview:
         atexit.unregister(self.stop)
         picam2.asynchronous = False
 
-    def __init__(self, picam2):
+    def __init__(self, picam2, width=None, height=None):
+        # Ignore width and height as they are meaningless. We only accept them so as to
+        # be a drop-in replacement for the Qt/DRM previews.
+        self.size = (width, height)
         self.event = threading.Event()
         self.thread = threading.Thread(target=self.thread_func, args=(picam2,))
         self.thread.setDaemon(True)

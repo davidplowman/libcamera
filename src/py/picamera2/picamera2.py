@@ -152,6 +152,8 @@ class Picamera2:
 
     def generate_configuration(self, camera_config):
         """Generate a camera configuration according to the given specification."""
+        if self.camera is None:
+            raise RuntimeError("Camera has not been opened")
         if isinstance(camera_config, dict):
             if "streams" not in camera_config:
                 camera_config = {"transform": pylibcamera.Transform(), "streams": [camera_config]}
@@ -551,12 +553,19 @@ class CompletedRequest:
             raise RuntimeError("Format " + fmt + " not supported")
         return image
 
-    def make_pil_image(self, index):
+    def make_pil_image(self, index, width=None, height=None):
         rgb = self.make_image(index)
         fmt = self.picam2.streams[index].configuration.fmt
         mode_lookup = {"RGB888": "BGR", "BGR888": "RGB", "XBGR8888": "RGBA", "XRGB8888": "BGRX"}
         mode = mode_lookup[fmt]
         pil_img = Image.frombuffer("RGB", (rgb.shape[1], rgb.shape[0]), rgb, "raw", mode, 0, 1)
+        if width is None:
+            width = rgb.shape[1]
+        if height is None:
+            height = rgb.shape[0]
+        if width != rgb.shape[1] or height != rgb.shape[0]:
+            # This will be slow. Consider requesting camera images of this size in the first place!
+            pil_img = pil_img.resize((width, height))
         return pil_img
 
     def save(self, index, filename):

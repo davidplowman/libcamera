@@ -5,7 +5,7 @@ from picamera2 import *
 import time
 
 picam2 = Picamera2()
-preview = DrmPreview(picam2)
+preview = DrmPreview(picam2, 1024, 768)
 picam2.open_camera()
 
 cfg = picam2.generate_configuration({"role": "preview"})

@@ -14,10 +14,10 @@ class DrmPreview(NullPreview):
         "YVU420": pykms.PixelFormat.YVU420,
     }
 
-    def __init__(self, picam2):
-        self.init_drm()
+    def __init__(self, picam2, width=640, height=480):
+        self.init_drm(width, height)
         self.stop_count = 0
-        super().__init__(picam2)
+        super().__init__(picam2, width=width, height=height)
 
     def handle_request(self, picam2):
         completed_request = picam2.process_requests()
@@ -25,7 +25,7 @@ class DrmPreview(NullPreview):
         if completed_request:
             self.render_drm(picam2, completed_request)
 
-    def init_drm(self):
+    def init_drm(self, width, height):
         self.card = pykms.Card()
         self.resman = pykms.ResourceManager(self.card)
         conn = self.resman.reserve_connector()
@@ -34,7 +34,7 @@ class DrmPreview(NullPreview):
         self.plane = None
         self.drmfbs = {}
         self.current = None
-        self.window = (0, 0, 640, 480)
+        self.window = (0, 0, width, height)
 
     def render_drm(self, picam2, completed_request):
         stream = picam2.streams[picam2.preview_stream]
