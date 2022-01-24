@@ -13,7 +13,7 @@ class NullPreview:
         self.event.set()
 
         while self.running:
-            events = sel.select()
+            events = sel.select(0.2)
             for key, mask in events:
                 callback = key.data
                 callback(picam2)

@@ -108,16 +108,19 @@ class Picamera2:
         return fmt in ("NV21", "NV12", "YUV420", "YVU420", "YVYU", "YUYV", "UYVY", "VYUY")
 
     def is_RGB(self, fmt):
-        return fmt in ("BGR888", "RGB888", "XBGR8888", "XRGB888")
+        return fmt in ("BGR888", "RGB888", "XBGR8888", "XRGB8888")
 
-    def massage_configuration(self, camera_config):
+    def massage_configuration(self, orig_camera_config, camera_config):
         # Adjust the camera configuration to be more appropriate to Python users.
         raw_stream = None
         # stream1 will be the main output which can be RGB. If present, stream2 must be
         # no larger than stream1 and YUV.
         stream1 = None
         stream2 = None
-        for stream_config in camera_config["streams"]:
+        for orig_stream_config, stream_config in zip(orig_camera_config["streams"], camera_config["streams"]):
+            # If no format was requested by the user, go with XRGB8888 as most things will cope.
+            if "format" not in orig_stream_config:
+                stream_config["format"] = "XRGB8888"
             if stream_config["role"] == "raw":
                 raw_stream = stream_config
             else:
@@ -143,8 +146,6 @@ class Picamera2:
 
         if stream2 and not self.is_YUV(stream2["format"]):
             raise RuntimeError("Second stream must be a YUV format")
-        if stream1:
-            stream1["format"] = "XRGB8888"
 
         if self.verbose:
             print("massage_configuration out:", camera_config)
@@ -161,7 +162,7 @@ class Picamera2:
             camera_config = {"transform": pylibcamera.Transform(), "streams": camera_config}
         else:
             raise RuntimeError("Invalid camera configuration")
-        return self.massage_configuration(self.generate_configuration_(camera_config))
+        return self.massage_configuration(camera_config, self.generate_configuration_(camera_config))
 
     def python_to_lc_camera_config(self, camera_config):
         # Convert a Python-ified camera config to a libcamera one.
@@ -344,10 +345,10 @@ class Picamera2:
         if self.functions:
             i = 0
             function = self.functions[0]
-            if self.verbose:
-                print("Execute function", function)
-                if function(request):
-                    self.functions = self.functions[1:]
+            # if self.verbose:
+            #     print("Execute function", function)
+            if function(request):
+                self.functions = self.functions[1:]
             # Once we've done everything, signal the fact to the thread that requested this work.
             if not self.functions:
                 if self.async_signal_function is None:
@@ -413,7 +414,7 @@ class Picamera2:
         self.async_result = self.camera_configuration
         return True
 
-    def switch_mode(self, camera_config, wait=True):
+    def switch_mode(self, camera_config, wait=True, signal_function=signal_event):
         """Switch the camera into another mode given by the camera_config."""
         functions = [(lambda r: self.switch_mode_(camera_config))]
         return self.dispatch_functions(functions, wait, signal_function)
@@ -432,15 +433,15 @@ class Picamera2:
                      (lambda r: capture_and_switch_back_(self, r, filename, preview_config))]
         return self.dispatch_functions(functions, wait, signal_function)
 
-    def get_completed_request_(self, request):
+    def capture_request_(self, request):
         request.acquire()
         self.async_result = request
         return True
 
-    def get_completed_request(self, wait=True, signal_function=signal_event):
+    def capture_request(self, wait=True, signal_function=signal_event):
         """Fetch the next completed request from the camera system. You will be holding a
         reference to this request so you must release it again to return it to the camera system."""
-        return self.dispatch_functions([self.get_completed_request_], wait, signal_function)
+        return self.dispatch_functions([self.capture_request_], wait, signal_function)
 
     def get_metadata_(self, request):
         self.async_result = request.get_metadata()
@@ -450,29 +451,74 @@ class Picamera2:
         """Fetch the metadata from the next camera frame."""
         return self.dispatch_functions([self.get_metadata_], wait, signal_function)
 
-    def make_array_(self, request, index):
+    def capture_buffer_(self, request, index):
+        self.async_result = request.make_buffer(index)
+        return True
+
+    def capture_buffer(self, index=0, wait=True, signal_function=signal_event):
+        """Make a numpy array from the next frame in the numbered stream."""
+        return self.dispatch_functions([(lambda r: self.capture_buffer_(r, index))], wait, signal_function)
+
+    def switch_mode_and_capture_buffer(self, camera_config, index=0, wait=True, signal_function=signal_event):
+        """Switch the camera into a new (capture) mode, capture the first image buffer, then return
+        back to the initial camera mode."""
+        preview_config = self.camera_configuration
+
+        def capture_buffer_and_switch_back_(self, request, preview_config, index):
+            buffer = request.make_buffer(index)
+            self.switch_mode_(preview_config)
+            self.async_result = buffer
+            return True
+
+        functions = [(lambda r: self.switch_mode_(camera_config)),
+                     (lambda r: capture_buffer_and_switch_back_(self, r, preview_config, index))]
+        return self.dispatch_functions(functions, wait, signal_function)
+
+    def capture_array_(self, request, index):
         self.async_result = request.make_array(index)
         return True
 
-    def make_array(self, index=0, wait=True, signal_function=signal_event):
-        """Make a numpy array from the next frame in the numbered stream."""
-        return self.dispatch_functions([(lambda r: self.make_array_(r, index))], wait, signal_function)
+    def capture_array(self, index=0, wait=True, signal_function=signal_event):
+        """Make a 2d image from the next frame in the numbered stream."""
+        return self.dispatch_functions([(lambda r: self.capture_array_(r, index))], wait, signal_function)
 
-    def make_image_(self, request, index):
+    def switch_mode_and_capture_array(self, camera_config, index=0, wait=True, signal_function=signal_event):
+        """Switch the camera into a new (capture) mode, capture the image array data, then return
+        back to the initial camera mode."""
+        preview_config = self.camera_configuration
+
+        def capture_array_and_switch_back_(self, request, preview_config, index):
+            array = request.make_array(index)
+            self.switch_mode_(preview_config)
+            self.async_result = array
+            return True
+
+        functions = [(lambda r: self.switch_mode_(camera_config)),
+                     (lambda r: capture_array_and_switch_back_(self, r, preview_config, index))]
+        return self.dispatch_functions(functions, wait, signal_function)
+
+    def capture_image_(self, request, index):
         self.async_result = request.make_image(index)
         return True
 
-    def make_image(self, index=0, wait=True, signal_function=signal_event):
+    def capture_image(self, index=0, wait=True, signal_function=signal_event):
         """Make a 2d image from the next frame in the numbered stream."""
         return self.dispatch_functions([(lambda r: self.make_image_(r, index))], wait, signal_function)
 
-    def make_pil_image_(self, request, index):
-        self.async_result = request.make_pil_image(index)
-        return True
+    def switch_mode_and_capture_image(self, camera_config, index=0, wait=True, signal_function=signal_event):
+        """Switch the camera into a new (capture) mode, capture the image, then return
+        back to the initial camera mode."""
+        preview_config = self.camera_configuration
 
-    def make_pil_image(self, index=0, wait=True, signal_function=signal_event):
-        """Make a 2d image from the next frame in the numbered stream."""
-        return self.dispatch_functions([(lambda r: self.make_pil_image_(r, index))], wait, signal_function)
+        def capture_image_and_switch_back_(self, request, preview_config, index):
+            image = request.make_image(index)
+            self.switch_mode_(preview_config)
+            self.async_result = image
+            return True
+
+        functions = [(lambda r: self.switch_mode_(camera_config)),
+                     (lambda r: capture_image_and_switch_back_(self, r, preview_config, index))]
+        return self.dispatch_functions(functions, wait, signal_function)
 
 
 class CompletedRequest:
@@ -510,7 +556,7 @@ class CompletedRequest:
                         self.request.camera.queueRequest(self.request)
                 self.request = None
 
-    def make_array(self, index):
+    def make_buffer(self, index):
         """Make a numpy array from the numbered stream's buffer in this completed request."""
         stream = self.picam2.streams[index]
         fb = self.request.buffers[stream]
@@ -526,9 +572,9 @@ class CompletedRequest:
         w, h = config["size"]
         return {"width": w, "height": h, "stride": config["stride"], "format": config["format"]}
 
-    def make_image(self, index):
+    def make_array(self, index):
         """Make a PIL image from the numbered stream's buffer in this completed request."""
-        array = self.make_array(index)
+        array = self.make_buffer(index)
         config = self.picam2.stream_format(index)
         fmt = config["format"]
         w, h = config["size"]
@@ -553,8 +599,8 @@ class CompletedRequest:
             raise RuntimeError("Format " + fmt + " not supported")
         return image
 
-    def make_pil_image(self, index, width=None, height=None):
-        rgb = self.make_image(index)
+    def make_image(self, index, width=None, height=None):
+        rgb = self.make_array(index)
         fmt = self.picam2.streams[index].configuration.fmt
         mode_lookup = {"RGB888": "BGR", "BGR888": "RGB", "XBGR8888": "RGBA", "XRGB8888": "BGRX"}
         mode = mode_lookup[fmt]
@@ -572,7 +618,7 @@ class CompletedRequest:
         """Save a JPEG or PNG image of the numbered stream's buffer in this completed request."""
         # This is probably a hideously expensive way to do a capture.
         start_time = time.time()
-        img = self.make_pil_image(index)
+        img = self.make_image(index)
         if img.mode == "RGBA":
             # Nasty hack. Qt doesn't understand RGBX so we have to use RGBA. But saving a JPEG
             # doesn't like RGBA to we have to bodge that to RGBX.
