@@ -17,12 +17,12 @@ class H264Encoder():
         self.bufs = {}
         self.vd = open('/dev/video11', 'rb+', buffering=0)
 
-        self.q = queue.Queue()
-        self.q2 = queue.Queue()
+        self.buf_available = queue.Queue()
+        self.buf_frame = queue.Queue()
 
-        self.thread2 = threading.Thread(target=self.thread_poll, args=(self.q,))
-        self.thread2.setDaemon(True)
-        self.thread2.start()
+        self.thread = threading.Thread(target=self.thread_poll, args=(self.buf_available,))
+        self.thread.setDaemon(True)
+        self.thread.start()
 
         cp = v4l2_capability()
         fcntl.ioctl(self.vd, VIDIOC_QUERYCAP, cp)
@@ -68,7 +68,7 @@ class H264Encoder():
         fcntl.ioctl(self.vd, VIDIOC_REQBUFS, reqbufs)
 
         for i in range(reqbufs.count):
-            self.q.put(i)
+            self.buf_available.put(i)
 
         reqbufs = v4l2_requestbuffers()
         reqbufs.count = NUM_CAPTURE_BUFFERS
@@ -96,7 +96,7 @@ class H264Encoder():
         typev = v4l2_buf_type(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
         fcntl.ioctl(self.vd, VIDIOC_STREAMON, typev)
 
-    def thread_poll(self, q):
+    def thread_poll(self, buf_available):
         f1 = open('test.bin','ab')
         pollit = select.poll()
         pollit.register(self.vd, select.POLLIN)
@@ -114,7 +114,7 @@ class H264Encoder():
                     ret = fcntl.ioctl(self.vd, VIDIOC_DQBUF, buf)
 
                     if ret == 0:
-                        q.put(buf.index)
+                        buf_available.put(buf.index)
 
                     buf = v4l2_buffer()
                     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
@@ -147,7 +147,7 @@ class H264Encoder():
                         ret = fcntl.ioctl(self.vd, VIDIOC_QBUF, buf)
 
                         # Release frame from camera
-                        l = self.q2.get()
+                        l = self.buf_frame.get()
                         l.release()
 
     def encode(self, stream, request):
@@ -165,7 +165,7 @@ class H264Encoder():
         planes = v4l2_plane * VIDEO_MAX_PLANES
         planes = planes()
         buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
-        buf.index = self.q.get()
+        buf.index = self.buf_available.get()
         buf.field = V4L2_FIELD_NONE
         buf.memory = V4L2_MEMORY_DMABUF
         buf.length = 1
@@ -176,7 +176,7 @@ class H264Encoder():
         buf.m.planes[0].bytesused = cfg.frameSize
         buf.m.planes[0].length = cfg.frameSize
         ret = fcntl.ioctl(self.vd, VIDIOC_QBUF, buf)
-        self.q2.put(request)
+        self.buf_frame.put(request)
 
         cur = time.time()
         if self.lastframetime is not None:
