@@ -182,6 +182,3 @@ class H264Encoder():
         if self.lastframetime is not None:
             print(cur - self.lastframetime)
         self.lastframetime = cur
-
-    def stop(self):
-        self.running = False
