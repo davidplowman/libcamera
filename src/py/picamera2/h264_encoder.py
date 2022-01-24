@@ -32,7 +32,6 @@ class H264Encoder():
         ctrl.value = 10000000
         fcntl.ioctl(self.vd, VIDIOC_S_CTRL, ctrl)
 
-        V4L2_PIX_FMT_H264 = v4l2_fourcc('H', '2', '6', '4')
         W = 1920
         H = 1080
 
