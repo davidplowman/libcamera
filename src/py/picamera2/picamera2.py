@@ -29,6 +29,7 @@ class Picamera2:
         self.controls_lock = threading.Lock()
         self.controls = {}
         self.options = {}
+        self.encoder = None
 
         if self.verbose:
             print("Camera manager:", self.camera_manager)
@@ -330,6 +331,9 @@ class Picamera2:
         for request in requests[:-1]:
             request.release()
         request = requests[-1]
+
+        if self.encoder is not None:
+            self.encoder.encode(self.streams[self.video_stream], request)
 
         # Once the event loop is running, we don't want picamera2 commands to run in any other
         # thread, so they simply queue up functions for us to call here, in the event loop.

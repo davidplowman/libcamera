@@ -15,7 +15,8 @@ cfg = picam2.generate_configuration({"role": "video"})
 cfg["streams"][0]["format"] = "YUV420"
 picam2.configure(cfg)
 
-h264 = H264Encoder(picam2)
+preview = NullPreview(picam2)
+picam2.encoder = H264Encoder()
 
 picam2.start()
 time.sleep(10)

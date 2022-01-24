@@ -6,17 +6,14 @@ import atexit
 import fcntl
 import mmap
 import select
+import time
 from v4l2 import *
 
 class H264Encoder():
 
-    def __init__(self, picam2):
-        self.event = threading.Event()
-        self.thread = threading.Thread(target=self.thread_func, args=(picam2,))
-        self.thread.setDaemon(True)
+    def __init__(self):
+        self.lastframetime = None
         self.running = True
-        self.thread.start()
-        self.event.wait()
         self.bufs = {}
         self.idx = 0
         self.vd = open('/dev/video11', 'rb+', buffering=0)
@@ -106,22 +103,6 @@ class H264Encoder():
         typev = v4l2_buf_type(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
         fcntl.ioctl(self.vd, VIDIOC_STREAMON, typev)
 
-    def thread_func(self, picam2):
-        picam2.asynchronous = True
-        sel = selectors.DefaultSelector()
-        sel.register(picam2.camera_manager.efd, selectors.EVENT_READ, self.handle_request)
-        atexit.register(self.stop)
-        self.event.set()
-
-        while self.running:
-            events = sel.select()
-            for key, mask in events:
-                callback = key.data
-                callback(picam2)
-
-        atexit.unregister(self.stop)
-        picam2.asynchronous = False
-
     def thread_poll(self, q):
         f1 = open('test.bin','ab')
         pollit = select.poll()
@@ -176,20 +157,13 @@ class H264Encoder():
                         l = self.q2.get()
                         l.release()
 
-
-
-    def handle_request(self, picam2):
-        completed_request = picam2.process_requests()
-        if completed_request is None:
-            return
-
-        stream = picam2.streams[picam2.video_stream]
+    def encode(self, stream, request):
         cfg = stream.configuration
         width, height = cfg.size
-
-        fb = completed_request.request.buffers[stream]
+        fb = request.request.buffers[stream]
         fd = fb.fd(0)
         stride = cfg.stride
+        request.acquire()
 
         buf = v4l2_buffer()
         timestamp_us = fb.metadata.timestamp / 1000
@@ -209,8 +183,12 @@ class H264Encoder():
         buf.m.planes[0].bytesused = cfg.frameSize
         buf.m.planes[0].length = cfg.frameSize
         ret = fcntl.ioctl(self.vd, VIDIOC_QBUF, buf)
-        self.q2.put(completed_request)
+        self.q2.put(request)
+
+        cur = time.time()
+        if self.lastframetime is not None:
+            print(cur - self.lastframetime)
+        self.lastframetime = cur
 
     def stop(self):
         self.running = False
-        self.thread.join()
