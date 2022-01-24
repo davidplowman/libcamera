@@ -21,7 +21,8 @@ button1 = QPushButton("Start Camera")
 
 
 def on_button1_clicked():
-    picam2.start()
+    if not picam2.started:
+        picam2.start()
 
 
 button1.clicked.connect(on_button1_clicked)

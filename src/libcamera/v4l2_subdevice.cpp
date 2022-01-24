@@ -170,6 +170,21 @@ const std::map<uint32_t, V4L2SubdeviceFormatInfo> formatInfoMap = {
  */
 
 /**
+ * \var V4L2SubdeviceFormat::colorSpace
+ * \brief The color space of the pixels
+ *
+ * The color space of the image. When setting the format this may be
+ * unset, in which case the driver gets to use its default color space.
+ * After being set, this value should contain the color space that
+ * was actually used. If this value is unset, then the color space chosen
+ * by the driver could not be represented by the ColorSpace class (and
+ * should probably be added).
+ *
+ * It is up to the pipeline handler or application to check if the
+ * resulting color space is acceptable.
+ */
+
+/**
  * \brief Assemble and return a string describing the format
  * \return A string describing the V4L2SubdeviceFormat
  */
@@ -400,6 +415,7 @@ int V4L2Subdevice::getFormat(unsigned int pad, V4L2SubdeviceFormat *format,
 	format->size.width = subdevFmt.format.width;
 	format->size.height = subdevFmt.format.height;
 	format->mbus_code = subdevFmt.format.code;
+	format->colorSpace = toColorSpace(subdevFmt.format);
 
 	return 0;
 }
@@ -427,6 +443,7 @@ int V4L2Subdevice::setFormat(unsigned int pad, V4L2SubdeviceFormat *format,
 	subdevFmt.format.height = format->size.height;
 	subdevFmt.format.code = format->mbus_code;
 	subdevFmt.format.field = V4L2_FIELD_NONE;
+	fromColorSpace(format->colorSpace, subdevFmt.format);
 
 	int ret = ioctl(VIDIOC_SUBDEV_S_FMT, &subdevFmt);
 	if (ret) {
@@ -439,6 +456,7 @@ int V4L2Subdevice::setFormat(unsigned int pad, V4L2SubdeviceFormat *format,
 	format->size.width = subdevFmt.format.width;
 	format->size.height = subdevFmt.format.height;
 	format->mbus_code = subdevFmt.format.code;
+	format->colorSpace = toColorSpace(subdevFmt.format);
 
 	return 0;
 }

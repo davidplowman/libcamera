@@ -6,11 +6,11 @@ from PIL.ImageQt import ImageQt
 
 
 class QPicamera2(QWidget):
-    def __init__(self, picam2, parent=None):
+    def __init__(self, picam2, parent=None, width=640, height=480):
         super().__init__(parent=parent)
         self.picamera2 = picam2
         self.label = QLabel(self)
-        self.label.resize(640, 480)
+        self.label.resize(width, height)
         self.label.setText("Camera Preview")
         self.camera_notifier = QSocketNotifier(self.picamera2.camera_manager.efd,
                                                QtCore.QSocketNotifier.Read,
@@ -20,11 +20,13 @@ class QPicamera2(QWidget):
     @pyqtSlot()
     def handle_requests(self):
         request = self.picamera2.process_requests()
-        if not request:
-            return
+        if request:
+            self.handle_one_request(request)
 
+    def handle_one_request(self, request):
         if self.picamera2.preview_stream >= 0:
-            img = request.make_pil_image(self.picamera2.preview_stream)
+            size = self.label.size()
+            img = request.make_image(self.picamera2.preview_stream, size.width(), size.height())
             qim = ImageQt(img).copy()
             pix = QtGui.QPixmap.fromImage(qim)
             self.label.setPixmap(pix)

@@ -30,27 +30,18 @@ static py::object ValueOrTuple(const ControlValue &cv)
 {
 	if (cv.isArray()) {
 		const T *v = reinterpret_cast<const T *>(cv.data().data());
-		switch (cv.numElements()) {
-		case 0:
-			return py::make_tuple();
-		case 1:
-			return py::make_tuple(v[0]);
-		case 2:
-			return py::make_tuple(v[0], v[1]);
-		case 3:
-			return py::make_tuple(v[0], v[1], v[2]);
-		default:
-			return py::make_tuple(v[0], v[1], v[2], v[3]);
-		}
+		auto t = py::tuple(cv.numElements());
+
+		for (unsigned int i = 0; i < cv.numElements(); ++i)
+			t[i] = v[i];
+
+		return t;
 	}
 	return py::cast(cv.get<T>());
 }
 
 static py::object ControlValueToPy(const ControlValue &cv)
 {
-	//assert(!cv.isArray());
-	//assert(cv.numElements() == 1);
-
 	switch (cv.type()) {
 	case ControlTypeBool:
 		return ValueOrTuple<bool>(cv);
@@ -336,7 +327,22 @@ PYBIND11_MODULE(pycamera, m)
 		.def_readwrite("stride", &StreamConfiguration::stride)
 		.def_readwrite("frameSize", &StreamConfiguration::frameSize)
 		.def_readwrite("bufferCount", &StreamConfiguration::bufferCount)
-		.def_property_readonly("formats", &StreamConfiguration::formats, py::return_value_policy::reference_internal);
+		.def_property_readonly("formats", &StreamConfiguration::formats, py::return_value_policy::reference_internal)
+		.def_property("colorSpace",
+			      [](StreamConfiguration &self) {
+				      py::object ret;
+				      if (self.colorSpace)
+					      ret = py::cast(*self.colorSpace);
+				      else
+					      ret = py::none();
+				      return ret;
+			      },
+			      [](StreamConfiguration &self, py::object colorSpace) {
+				      if (colorSpace.is(py::none()))
+					      self.colorSpace.reset();
+				      else
+					      self.colorSpace = colorSpace.cast<ColorSpace>();
+			      });
 	;
 
 	py::class_<StreamFormats>(m, "StreamFormats")
@@ -466,20 +472,20 @@ PYBIND11_MODULE(pycamera, m)
 		});
 
 	py::class_<Transform>(m, "Transform")
-		.def(py::init([]() { return Transform::Identity; }))
-		.def(py::init([](int hflip, int vflip, int transpose) {
-			Transform t = Transform::Identity;
+		.def(py::init([](int rotation, int hflip, int vflip, int transpose) {
+			Transform t = transformFromRotation(rotation);
 			if (hflip)
-				t |= Transform::HFlip;
+				t ^= Transform::HFlip;
 			if (vflip)
-				t |= Transform::VFlip;
+				t ^= Transform::VFlip;
 			if (transpose)
-				t |= Transform::Transpose;
+				t ^= Transform::Transpose;
 			return t;
-		}))
-		.def(py::init([](int rotation) {
-			return transformFromRotation(rotation);
-		}))
+		}),
+		py::arg("rotation") = 0,
+		py::arg("hflip") = 0,
+		py::arg("vflip") = 0,
+		py::arg("transpose") = 0)
 		.def(py::init([](Transform &other) { return other; }))
 		.def("__repr__", [](Transform &self) {
 			return "<pycamera.Transform '" + std::string(transformToString(self)) + "'>";
@@ -523,4 +529,67 @@ PYBIND11_MODULE(pycamera, m)
 			self = self * other;
 			return py::none();
 		});
+
+	py::enum_<ColorSpace::Primaries>(m, "Primaries")
+		.value("Raw", ColorSpace::Primaries::Raw)
+		.value("Smpte170m", ColorSpace::Primaries::Smpte170m)
+		.value("Rec709", ColorSpace::Primaries::Rec709)
+		.value("Rec2020", ColorSpace::Primaries::Rec2020);
+
+	py::enum_<ColorSpace::TransferFunction>(m, "TransferFunction")
+		.value("Linear", ColorSpace::TransferFunction::Linear)
+		.value("Srgb", ColorSpace::TransferFunction::Srgb)
+		.value("Rec709", ColorSpace::TransferFunction::Rec709);
+
+	py::enum_<ColorSpace::YcbcrEncoding>(m, "YcbcrEncoding")
+		.value("None", ColorSpace::YcbcrEncoding::None)
+		.value("Rec601", ColorSpace::YcbcrEncoding::Rec601)
+		.value("Rec709", ColorSpace::YcbcrEncoding::Rec709)
+		.value("Rec2020", ColorSpace::YcbcrEncoding::Rec2020);
+
+	py::enum_<ColorSpace::Range>(m, "Range")
+		.value("Full", ColorSpace::Range::Full)
+		.value("Limited", ColorSpace::Range::Limited);
+
+	py::class_<ColorSpace>(m, "ColorSpace")
+		.def(py::init([](ColorSpace::Primaries primaries,
+				 ColorSpace::TransferFunction transferFunction,
+				 ColorSpace::YcbcrEncoding ycbcrEncoding,
+				 ColorSpace::Range range) {
+			return ColorSpace(primaries, transferFunction, ycbcrEncoding, range);
+		}),
+		py::arg("primaries"),
+		py::arg("transferFunction"),
+		py::arg("ycbcrEncoding"),
+		py::arg("range"))
+		.def(py::init([](ColorSpace &other) { return other; }))
+		.def("__repr__", [](ColorSpace &self) {
+			return "<pycamera.ColorSpace '" + self.toString() + "'>";
+		})
+		.def_property("primaries",
+			      [](ColorSpace &self) { return self.primaries; },
+			      [](ColorSpace &self, ColorSpace::Primaries primaries) {
+				      self.primaries = primaries;
+			      })
+		.def_property("transferFunction",
+			      [](ColorSpace &self) { return self.transferFunction; },
+			      [](ColorSpace &self, ColorSpace::TransferFunction transferFunction) {
+				      self.transferFunction = transferFunction;
+			      })
+		.def_property("ycbcrEncoding",
+			      [](ColorSpace &self) { return self.ycbcrEncoding; },
+			      [](ColorSpace &self, ColorSpace::YcbcrEncoding ycbcrEncoding) {
+				      self.ycbcrEncoding = ycbcrEncoding;
+			      })
+		.def_property("range",
+			      [](ColorSpace &self) { return self.range; },
+			      [](ColorSpace &self, ColorSpace::Range range) {
+				      self.range = range;
+			      })
+		.def_static("Raw", []() { return ColorSpace::Raw; })
+		.def_static("Jpeg", []() { return ColorSpace::Jpeg; })
+		.def_static("Srgb", []() { return ColorSpace::Srgb; })
+		.def_static("Smpte170m", []() { return ColorSpace::Smpte170m; })
+		.def_static("Rec709", []() { return ColorSpace::Rec709; })
+		.def_static("Rec2020", []() { return ColorSpace::Rec2020; });
 }
