@@ -30,27 +30,18 @@ static py::object ValueOrTuple(const ControlValue &cv)
 {
 	if (cv.isArray()) {
 		const T *v = reinterpret_cast<const T *>(cv.data().data());
-		switch (cv.numElements()) {
-		case 0:
-			return py::make_tuple();
-		case 1:
-			return py::make_tuple(v[0]);
-		case 2:
-			return py::make_tuple(v[0], v[1]);
-		case 3:
-			return py::make_tuple(v[0], v[1], v[2]);
-		default:
-			return py::make_tuple(v[0], v[1], v[2], v[3]);
-		}
+		auto t = py::tuple(cv.numElements());
+
+		for (unsigned int i = 0; i < cv.numElements(); ++i)
+			t[i] = v[i];
+
+		return t;
 	}
 	return py::cast(cv.get<T>());
 }
 
 static py::object ControlValueToPy(const ControlValue &cv)
 {
-	//assert(!cv.isArray());
-	//assert(cv.numElements() == 1);
-
 	switch (cv.type()) {
 	case ControlTypeBool:
 		return ValueOrTuple<bool>(cv);
