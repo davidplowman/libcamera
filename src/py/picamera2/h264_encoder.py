@@ -15,7 +15,6 @@ class H264Encoder():
         self.lastframetime = None
         self.running = True
         self.bufs = {}
-        self.idx = 0
         self.vd = open('/dev/video11', 'rb+', buffering=0)
 
         self.q = queue.Queue()
@@ -27,11 +26,6 @@ class H264Encoder():
 
         cp = v4l2_capability()
         fcntl.ioctl(self.vd, VIDIOC_QUERYCAP, cp)
-        print("Driver:", "".join((chr(c) for c in cp.driver)))
-        print("Name:", "".join((chr(c) for c in cp.card)))
-        print("Is a video capture device?", bool(cp.capabilities & V4L2_CAP_VIDEO_CAPTURE))
-        print("Supports read() call?", bool(cp.capabilities &  V4L2_CAP_READWRITE))
-        print("Supports streaming?", bool(cp.capabilities & V4L2_CAP_STREAMING))
 
         ctrl = v4l2_control()
         ctrl.id = V4L2_CID_MPEG_VIDEO_BITRATE
