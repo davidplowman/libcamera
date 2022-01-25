@@ -7,11 +7,13 @@ import fcntl
 import mmap
 import select
 import time
+from encoder import *
 from v4l2 import *
 
-class H264Encoder():
+class H264Encoder(Encoder):
 
-    def __init__(self):
+    def __init__(self, width, height, bitrate):
+        super().__init__(width, height, bitrate)
         self.lastframetime = None
         self.running = True
         self.bufs = {}
@@ -29,16 +31,13 @@ class H264Encoder():
 
         ctrl = v4l2_control()
         ctrl.id = V4L2_CID_MPEG_VIDEO_BITRATE
-        ctrl.value = 10000000
+        ctrl.value = self._bitrate
         fcntl.ioctl(self.vd, VIDIOC_S_CTRL, ctrl)
-
-        W = 1920
-        H = 1080
 
         fmt = v4l2_format()
         fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
-        fmt.fmt.pix_mp.width = W
-        fmt.fmt.pix_mp.height = H
+        fmt.fmt.pix_mp.width = self._width
+        fmt.fmt.pix_mp.height = self._height
         fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_YUV420
         fmt.fmt.pix_mp.plane_fmt[0].bytesperline = 1920
         fmt.fmt.pix_mp.field = V4L2_FIELD_ANY
@@ -48,8 +47,8 @@ class H264Encoder():
 
         fmt = v4l2_format()
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
-        fmt.fmt.pix_mp.width = W
-        fmt.fmt.pix_mp.height = H
+        fmt.fmt.pix_mp.width = self._width
+        fmt.fmt.pix_mp.height = self._height
         fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_H264
         fmt.fmt.pix_mp.field = V4L2_FIELD_ANY
         fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_DEFAULT

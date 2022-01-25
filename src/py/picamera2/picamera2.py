@@ -5,6 +5,7 @@ import pycamera as pylibcamera
 import numpy as np
 import threading
 from PIL import Image
+from encoder import Encoder
 import time
 
 
@@ -29,7 +30,7 @@ class Picamera2:
         self.controls_lock = threading.Lock()
         self.controls = {}
         self.options = {}
-        self.encoder = None
+        self._encoder = None
 
         if self.verbose:
             print("Camera manager:", self.camera_manager)
@@ -339,8 +340,8 @@ class Picamera2:
             request.release()
         request = requests[-1]
 
-        if self.encoder is not None:
-            self.encoder.encode(self.streams[self.video_stream], request)
+        if self._encoder is not None:
+            self._encoder.encode(self.streams[self.video_stream], request)
 
         # Once the event loop is running, we don't want picamera2 commands to run in any other
         # thread, so they simply queue up functions for us to call here, in the event loop.
@@ -523,6 +524,16 @@ class Picamera2:
         functions = [(lambda r: self.switch_mode_(camera_config)),
                      (lambda r: capture_image_and_switch_back_(self, r, preview_config, index))]
         return self.dispatch_functions(functions, wait, signal_function)
+
+    @property
+    def encoder(self):
+        return self._encoder
+
+    @encoder.setter
+    def encoder(self, value):
+        if not isinstance(value, Encoder):
+            raise RuntimeError("Must pass encoder instance")
+        self._encoder = value
 
 
 class CompletedRequest:

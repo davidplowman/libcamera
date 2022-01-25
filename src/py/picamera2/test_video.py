@@ -16,8 +16,9 @@ cfg["streams"][0]["format"] = "YUV420"
 picam2.configure(cfg)
 
 preview = NullPreview(picam2)
-picam2.encoder = H264Encoder()
+encoder = H264Encoder(1920, 1080, 10000000)
 
+picam2.encoder = encoder
 picam2.start()
 time.sleep(10)
 picam2.stop()
