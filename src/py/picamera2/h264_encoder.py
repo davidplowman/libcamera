@@ -14,7 +14,6 @@ class H264Encoder(Encoder):
 
     def __init__(self, width, height, bitrate):
         super().__init__(width, height, bitrate)
-        self.lastframetime = None
         self.running = True
         self.bufs = {}
         self.vd = open('/dev/video11', 'rb+', buffering=0)
@@ -176,8 +175,3 @@ class H264Encoder(Encoder):
         buf.m.planes[0].length = cfg.frameSize
         ret = fcntl.ioctl(self.vd, VIDIOC_QBUF, buf)
         self.buf_frame.put(request)
-
-        cur = time.time()
-        if self.lastframetime is not None:
-            print(cur - self.lastframetime)
-        self.lastframetime = cur
