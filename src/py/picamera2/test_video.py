@@ -6,8 +6,6 @@ from picamera2 import *
 import time
 import os
 
-os.remove("test.bin")
-
 picam2 = Picamera2()
 picam2.open_camera()
 
@@ -17,6 +15,7 @@ picam2.configure(cfg)
 
 preview = NullPreview(picam2)
 encoder = H264Encoder(1920, 1080, 10000000)
+encoder.output = open('test.h264', 'wb')
 
 picam2.encoder = encoder
 picam2.start()

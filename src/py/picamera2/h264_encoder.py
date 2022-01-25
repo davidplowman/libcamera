@@ -39,7 +39,7 @@ class H264Encoder(Encoder):
         fmt.fmt.pix_mp.width = self._width
         fmt.fmt.pix_mp.height = self._height
         fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_YUV420
-        fmt.fmt.pix_mp.plane_fmt[0].bytesperline = 1920
+        fmt.fmt.pix_mp.plane_fmt[0].bytesperline = self.width # is this correct?
         fmt.fmt.pix_mp.field = V4L2_FIELD_ANY
         fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_JPEG
         fmt.fmt.pix_mp.num_planes = 1
@@ -96,7 +96,6 @@ class H264Encoder(Encoder):
         fcntl.ioctl(self.vd, VIDIOC_STREAMON, typev)
 
     def thread_poll(self, buf_available):
-        f1 = open('test.bin','ab')
         pollit = select.poll()
         pollit.register(self.vd, select.POLLIN)
 
@@ -130,7 +129,8 @@ class H264Encoder(Encoder):
                         # Write output to file
                         b = self.bufs[buf.index][0].read(buf.m.planes[0].bytesused)
                         self.bufs[buf.index][0].seek(0)
-                        f1.write(b)
+                        if self._output is not None:
+                            self._output.write(b)
 
                         # Requeue encoded buffer
                         buf = v4l2_buffer()

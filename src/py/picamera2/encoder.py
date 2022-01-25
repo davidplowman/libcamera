@@ -1,3 +1,5 @@
+import io
+
 class Encoder:
     
     def __init__(self, width, height, bitrate):
@@ -6,6 +8,7 @@ class Encoder:
         self._width = width
         self._height = height
         self._bitrate = bitrate
+        self._output = None
 
     @property
     def width(self):
@@ -18,3 +21,13 @@ class Encoder:
     @property
     def bitrate(self):
         return self._bitrate
+
+    @property
+    def output(self):
+        return self._output
+
+    @output.setter
+    def output(self, value):
+        if not isinstance(value, io.BufferedIOBase):
+            raise RuntimeError("Must pass BufferedIOBase")
+        self._output = value
