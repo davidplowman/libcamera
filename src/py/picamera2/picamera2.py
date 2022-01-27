@@ -31,6 +31,7 @@ class Picamera2:
         self.controls = {}
         self.options = {}
         self._encoder = None
+        self.request_callback = None
 
         if self.verbose:
             print("Camera manager:", self.camera_manager)
@@ -365,6 +366,9 @@ class Picamera2:
         # this going back to the application.
         if request.stop_count != self.stop_count:
             request = None
+
+        if request and self.request_callback:
+            self.request_callback(request)
 
         return request
 
