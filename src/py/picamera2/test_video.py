@@ -18,6 +18,6 @@ encoder = H264Encoder(1920, 1080, 10000000)
 encoder.output = open('test.h264', 'wb')
 
 picam2.encoder = encoder
-picam2.start()
+picam2.start({"FrameDurationLimits": (33333, 33333)})
 time.sleep(10)
 picam2.stop()
