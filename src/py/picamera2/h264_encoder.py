@@ -12,10 +12,13 @@ from v4l2 import *
 
 class H264Encoder(Encoder):
 
-    def __init__(self, width, height, bitrate):
-        super().__init__(width, height, bitrate)
-        self.running = True
+    def __init__(self, bitrate):
+        super().__init__()
         self.bufs = {}
+        self._bitrate = bitrate
+
+    def _start(self):
+        super()._start()
         self.vd = open('/dev/video11', 'rb+', buffering=0)
 
         self.buf_available = queue.Queue()
@@ -94,11 +97,36 @@ class H264Encoder(Encoder):
         typev = v4l2_buf_type(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
         fcntl.ioctl(self.vd, VIDIOC_STREAMON, typev)
 
+    def _stop(self):
+        super()._stop()
+        self.thread.join()
+        typev = v4l2_buf_type(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+        fcntl.ioctl(self.vd, VIDIOC_STREAMOFF, typev)
+        typev = v4l2_buf_type(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+        fcntl.ioctl(self.vd, VIDIOC_STREAMOFF, typev)
+
+        reqbufs = v4l2_requestbuffers()
+        reqbufs.count = 0
+        reqbufs.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
+        reqbufs.memory = V4L2_MEMORY_DMABUF
+        fcntl.ioctl(self.vd, VIDIOC_REQBUFS, reqbufs)
+
+        for i in range(len(self.bufs)):
+            self.bufs[i][0].close()
+        self.bufs = {}
+
+        reqbufs = v4l2_requestbuffers()
+        reqbufs.count = 0
+        reqbufs.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+        reqbufs.memory = V4L2_MEMORY_MMAP
+        fcntl.ioctl(self.vd, VIDIOC_REQBUFS, reqbufs)
+        self.vd.close()
+
     def thread_poll(self, buf_available):
         pollit = select.poll()
         pollit.register(self.vd, select.POLLIN)
 
-        while self.running:
+        while self._running:
             for fd, event in pollit.poll(200):
                 if event & select.POLLIN:
                     buf = v4l2_buffer()

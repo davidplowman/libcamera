@@ -315,6 +315,24 @@ class Picamera2:
         else:
             self.stop_()
 
+    def start_encoder(self):
+        video = None
+        streams = self.camera_configuration['streams']
+        # Wasn't sure if we can have more than one video role, at the moment, just picking the first one
+        for stream in streams:
+            if stream['role'] == 'video':
+                video = stream
+                break
+        if video is None:
+            raise RuntimeError("No video stream found")
+        if self.encoder is None:
+            raise RuntimeError("No encoder specified")
+        self.encoder.width, self.encoder.height = video['size']
+        self.encoder._start()
+
+    def stop_encoder(self):
+        self.encoder._stop()
+
     def set_controls(self, controls):
         """Set camera controls. These will be delivered with the next request that gets submitted."""
         with self.controls_lock:
