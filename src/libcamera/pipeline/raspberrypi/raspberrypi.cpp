@@ -297,6 +297,12 @@ public:
 	/* Have internal buffers been allocated? */
 	bool buffersAllocated_;
 
+	struct SyncTableEntry {
+		uint32_t ipaCookie;
+		uint64_t controlListId;
+	};
+	std::queue<SyncTableEntry> syncTable_;
+
 private:
 	void checkRequestCompleted();
 	void fillRequestMetadata(const ControlList &bufferControls,
@@ -1067,9 +1073,17 @@ int PipelineHandlerRPi::start(Camera *camera, const ControlList *controls)
 	 * Reset the delayed controls with the gain and exposure values set by
 	 * the IPA.
 	 */
-	data->delayedCtrls_->reset();
+	uint32_t ipaCookie = 0;
+	data->delayedCtrls_->reset(ipaCookie);
 
 	data->state_ = RPiCameraData::State::Idle;
+
+	/*
+	 * Clear the sync table. The way the camera starts means we have to add
+	 * the first entry by hand.
+	 */
+	data->syncTable_ = std::queue<RPiCameraData::SyncTableEntry>();
+	data->syncTable_.emplace(RPiCameraData::SyncTableEntry{ ipaCookie, 0 });
 
 	/* Start all streams. */
 	for (auto const stream : data->streams_) {
@@ -1794,6 +1808,8 @@ void RPiCameraData::setDelayedControls(const ControlList &controls, uint32_t ipa
 {
 	if (!delayedCtrls_->push(controls, ipaCookie))
 		LOG(RPI, Error) << "V4L2 DelayedControl set failed";
+	/* Record which control list corresponds to this ipaCookie. */
+	syncTable_.emplace(SyncTableEntry{ ipaCookie, requestQueue_.front()->controlListId });
 	handleState();
 }
 
@@ -2147,6 +2163,16 @@ void RPiCameraData::tryRunPipeline()
 	 */
 	request->metadata().clear();
 	fillRequestMetadata(bayerFrame.controls, request);
+
+	/*
+	 * We know we that we added an entry for every ipaCookie, so we can
+	 * find the one for this Bayer frame, and this links us to the correct
+	 * control list. Anything ahead of "our" entry in the queue is old, so
+	 * can be dropped.
+	 */
+	while (syncTable_.front().ipaCookie != bayerFrame.ipaCookie)
+		syncTable_.pop();
+	request->syncId = syncTable_.front().controlListId;
 
 	/*
 	 * Process all the user controls by the IPA. Once this is complete, we
