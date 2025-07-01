@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -20,6 +21,7 @@
 namespace libcamera {
 
 class Camera;
+class PipelineHandler;
 
 class CameraManager : public Object, public Extensible
 {
@@ -33,6 +35,8 @@ public:
 
 	std::vector<std::shared_ptr<Camera>> cameras() const;
 	std::shared_ptr<Camera> get(std::string_view id);
+	std::vector<std::string> memoryCameras() const;
+	std::shared_ptr<Camera> getMemoryCamera(std::string_view id, std::string_view settings);
 
 	static const std::string &version() { return version_; }
 

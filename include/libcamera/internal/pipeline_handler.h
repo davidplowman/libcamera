@@ -70,6 +70,14 @@ public:
 
 	CameraManager *cameraManager() const { return manager_; }
 
+	virtual bool supportsMemoryCamera() { return false; }
+
+	virtual std::shared_ptr<Camera> createMemoryCamera([[maybe_unused]] DeviceEnumerator *enumerator,
+							   [[maybe_unused]] std::string_view settings)
+	{
+		return nullptr;
+	}
+
 protected:
 	void registerCamera(std::shared_ptr<Camera> camera);
 	void hotplugMediaDevice(MediaDevice *media);
