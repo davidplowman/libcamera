@@ -152,6 +152,13 @@ void CameraManager::Private::pipelineFactoryMatch(const PipelineHandlerFactoryBa
 {
 	CameraManager *const o = LIBCAMERA_O_PTR();
 
+	/* First check for any memory-to-memory camera pipelines. */
+	{
+		std::shared_ptr<PipelineHandler> pipe = factory->create(o);
+		if (pipe->supportsMemoryCamera())
+			memoryCameras_.push_back(std::string(pipe->name()));
+	}
+
 	/* Provide as many matching pipelines as possible. */
 	while (1) {
 		std::shared_ptr<PipelineHandler> pipe = factory->create(o);
@@ -162,6 +169,19 @@ void CameraManager::Private::pipelineFactoryMatch(const PipelineHandlerFactoryBa
 			<< "Pipeline handler \"" << factory->name()
 			<< "\" matched";
 	}
+}
+
+std::shared_ptr<Camera> CameraManager::Private::getMemoryCamera(const PipelineHandlerFactoryBase *factory,
+								std::string_view settings)
+{
+	CameraManager *const o = LIBCAMERA_O_PTR();
+
+	std::shared_ptr<PipelineHandler> pipe = factory->create(o);
+
+	pipe->moveToThread(this);
+
+	return pipe->invokeMethod(&PipelineHandler::createMemoryCamera,
+				  ConnectionTypeBlocking, enumerator_.get(), settings);
 }
 
 void CameraManager::Private::cleanup()
@@ -394,6 +414,26 @@ std::shared_ptr<Camera> CameraManager::get(std::string_view id)
 	for (const std::shared_ptr<Camera> &camera : d->cameras_) {
 		if (camera->id() == id)
 			return camera;
+	}
+
+	return nullptr;
+}
+
+std::vector<std::string> CameraManager::memoryCameras() const
+{
+	return _d()->memoryCameras_;
+}
+
+std::shared_ptr<Camera> CameraManager::getMemoryCamera(std::string_view id,
+						       std::string_view settings)
+{
+	for (const auto& name : _d()->memoryCameras_) {
+		if (name == id) {
+			const PipelineHandlerFactoryBase *factory;
+			factory = PipelineHandlerFactoryBase::getFactoryByName(name);
+
+			return _d()->getMemoryCamera(factory, settings);
+		}
 	}
 
 	return nullptr;
