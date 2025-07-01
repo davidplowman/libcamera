@@ -1170,6 +1170,25 @@ int CameraData::loadIPA(ipa::RPi::InitResult *result)
 	return ipa_->init(settings, params, result);
 }
 
+int CameraData::loadNamedIPA(std::string const &tuningFile, ipa::RPi::InitResult *result)
+{
+	int ret;
+
+	ipa_ = IPAManager::createIPA<ipa::RPi::IPAProxyRPi>(pipe(), 1, 1);
+
+	if (!ipa_)
+		return -ENOENT;
+
+	IPASettings settings(tuningFile, "default");
+	ipa::RPi::InitParams params;
+
+	ret = platformInitIpa(params);
+	if (ret)
+		return ret;
+
+	return ipa_->init(settings, params, result);
+}
+
 int CameraData::configureIPA(const CameraConfiguration *config, ipa::RPi::ConfigResult *result)
 {
 	ipa::RPi::ConfigParams params;

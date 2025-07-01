@@ -815,6 +815,11 @@ public:
 
 	bool match(DeviceEnumerator *enumerator) override;
 
+	bool supportsMemoryCamera() override;
+
+	std::shared_ptr<Camera> createMemoryCamera(DeviceEnumerator *enumerator,
+						   std::string_view settings) override;
+
 private:
 	PiSPCameraData *cameraData(Camera *camera)
 	{
@@ -822,6 +827,8 @@ private:
 	}
 
 	int prepareBuffers(Camera *camera) override;
+	std::shared_ptr<Camera> platformCreateCamera(std::unique_ptr<RPi::CameraData> &cameraData,
+						     MediaDevice *cfe, MediaDevice *isp);
 	int platformRegister(std::unique_ptr<RPi::CameraData> &cameraData,
 			     MediaDevice *cfe, MediaDevice *isp) override;
 };
@@ -888,10 +895,8 @@ bool PipelineHandlerPiSP::match(DeviceEnumerator *enumerator)
 			PiSPCameraData *pisp =
 				static_cast<PiSPCameraData *>(cameraData.get());
 
-			pisp->fe_ = SharedMemObject<FrontEnd>
-					("pisp_frontend", true, pisp->pispVariant_);
-			pisp->be_ = SharedMemObject<BackEnd>
-					("pisp_backend", BackEnd::Config({}), pisp->pispVariant_);
+			pisp->fe_ = SharedMemObject<FrontEnd>("pisp_frontend", true, pisp->pispVariant_);
+			pisp->be_ = SharedMemObject<BackEnd>("pisp_backend", BackEnd::Config({}), pisp->pispVariant_);
 
 			if (!pisp->fe_.fd().isValid() || !pisp->be_.fd().isValid()) {
 				LOG(RPI, Error) << "Failed to create ISP shared objects";
@@ -912,6 +917,84 @@ bool PipelineHandlerPiSP::match(DeviceEnumerator *enumerator)
 	}
 
 	return false;
+}
+
+bool PipelineHandlerPiSP::supportsMemoryCamera()
+{
+	return true;
+}
+
+static bool get_variant(unsigned int be_version, const libpisp::PiSPVariant **variant)
+{
+	for (const auto &hw : libpisp::get_variants()) {
+		if (hw.BackEndVersion() == be_version) {
+			*variant = &hw;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+std::shared_ptr<Camera>
+PipelineHandlerPiSP::createMemoryCamera(DeviceEnumerator *enumerator,
+					std::string_view settings)
+{
+	DeviceMatch isp("pispbe");
+	isp.add("pispbe-input");
+	isp.add("pispbe-config");
+	isp.add("pispbe-output0");
+	isp.add("pispbe-output1");
+	isp.add("pispbe-tdn_output");
+	isp.add("pispbe-tdn_input");
+	isp.add("pispbe-stitch_output");
+	isp.add("pispbe-stitch_input");
+	MediaDevice *ispDevice = acquireMediaDevice(enumerator, isp);
+
+	if (!ispDevice) {
+		LOG(RPI, Warning) << "Unable to acquire ISP instance";
+		return nullptr;
+	}
+
+	const libpisp::PiSPVariant *variant = nullptr;
+	if (!get_variant(ispDevice->hwRevision(), &variant)) {
+		LOG(RPI, Warning) << "Failed to find variant";
+		return nullptr;
+	}
+
+	std::unique_ptr<RPi::CameraData> cameraData =
+		std::make_unique<PiSPCameraData>(this, *variant);
+	PiSPCameraData *pisp =
+		static_cast<PiSPCameraData *>(cameraData.get());
+
+	/* Only need the back end, but creating the front end makes things easier */
+	pisp->fe_ = SharedMemObject<FrontEnd>("pisp_frontend", true, pisp->pispVariant_);
+	pisp->be_ = SharedMemObject<BackEnd>("pisp_backend", BackEnd::Config({}), pisp->pispVariant_);
+
+	if (!pisp->fe_.fd().isValid() || !pisp->be_.fd().isValid()) {
+		LOG(RPI, Error) << "Failed to create ISP shared objects";
+		return nullptr;
+	}
+
+	/*
+	 * Next, we want to do PipelineHandlerBase::registerCamera, including:
+	 *   loadIPA
+	 *   platformReigster
+	 *   loadPipelineConfiguration
+	 */
+
+	/* loadIPA is a bit different for us as we have a filename */
+	ipa::RPi::InitResult result;
+	std::string configFile = std::string(settings);
+	if (pisp->loadNamedIPA(configFile, &result)) {
+		LOG(RPI, Error) << "Failed to load a suitable IPA library";
+		return nullptr;
+	}
+	LOG(RPI, Info) << "Loaded IPA library " << configFile << " for memory camera";
+
+	std::shared_ptr<Camera> camera = platformCreateCamera(cameraData, nullptr, ispDevice);
+
+	return camera;
 }
 
 int PipelineHandlerPiSP::prepareBuffers(Camera *camera)
@@ -1021,16 +1104,51 @@ int PipelineHandlerPiSP::prepareBuffers(Camera *camera)
 	return 0;
 }
 
-int PipelineHandlerPiSP::platformRegister(std::unique_ptr<RPi::CameraData> &cameraData,
-					  MediaDevice *cfe, MediaDevice *isp)
+static int createCameraCfe(PiSPCameraData *data, MediaDevice *cfe, std::set<Stream *> &streams)
 {
-	PiSPCameraData *data = static_cast<PiSPCameraData *>(cameraData.get());
-	int ret;
-
 	MediaEntity *cfeImage = cfe->getEntityByName("rp1-cfe-fe_image0");
 	MediaEntity *cfeEmbedded = cfe->getEntityByName("rp1-cfe-embedded");
 	MediaEntity *cfeStats = cfe->getEntityByName("rp1-cfe-fe_stats");
 	MediaEntity *cfeConfig = cfe->getEntityByName("rp1-cfe-fe_config");
+
+	/* Locate and open the cfe video streams. */
+	data->cfe_[Cfe::Output0] = RPi::Stream("CFE Image", cfeImage, StreamFlag::RequiresMmap);
+	data->cfe_[Cfe::Embedded] = RPi::Stream("CFE Embedded", cfeEmbedded);
+	data->cfe_[Cfe::Stats] = RPi::Stream("CFE Stats", cfeStats);
+	data->cfe_[Cfe::Config] = RPi::Stream("CFE Config", cfeConfig,
+					      StreamFlag::Recurrent | StreamFlag::RequiresMmap);
+
+	/* Wire up all the buffer connections. */
+	data->cfe_[Cfe::Output0].dev()->bufferReady.connect(data, &PiSPCameraData::cfeBufferDequeue);
+	data->cfe_[Cfe::Stats].dev()->bufferReady.connect(data, &PiSPCameraData::cfeBufferDequeue);
+	data->cfe_[Cfe::Config].dev()->bufferReady.connect(data, &PiSPCameraData::cfeBufferDequeue);
+	data->cfe_[Cfe::Embedded].dev()->bufferReady.connect(data, &PiSPCameraData::cfeBufferDequeue);
+
+	data->csi2Subdev_ = std::make_unique<V4L2Subdevice>(cfe->getEntityByName("csi2"));
+	data->feSubdev_ = std::make_unique<V4L2Subdevice>(cfe->getEntityByName("pisp-fe"));
+	data->csi2Subdev_->open();
+	data->feSubdev_->open();
+
+	/*
+	 * The below grouping is just for convenience so that we can easily
+	 * iterate over all streams in one go.
+	 */
+	data->streams_.push_back(&data->cfe_[Cfe::Output0]);
+	data->streams_.push_back(&data->cfe_[Cfe::Config]);
+	data->streams_.push_back(&data->cfe_[Cfe::Stats]);
+	if (data->sensorMetadata_)
+		data->streams_.push_back(&data->cfe_[Cfe::Embedded]);
+
+	data->ipa_->setCameraTimeout.connect(data, &PiSPCameraData::setCameraTimeout);
+
+	/* Applications may ask for this stream. */
+	streams.insert(&data->cfe_[Cfe::Output0]);
+
+	return 0;
+}
+
+static int createCameraBe(PiSPCameraData *data, MediaDevice *isp, std::set<Stream *> &streams)
+{
 	MediaEntity *ispInput = isp->getEntityByName("pispbe-input");
 	MediaEntity *IpaPrepare = isp->getEntityByName("pispbe-config");
 	MediaEntity *ispOutput0 = isp->getEntityByName("pispbe-output0");
@@ -1039,13 +1157,6 @@ int PipelineHandlerPiSP::platformRegister(std::unique_ptr<RPi::CameraData> &came
 	MediaEntity *ispTdnInput = isp->getEntityByName("pispbe-tdn_input");
 	MediaEntity *ispStitchOutput = isp->getEntityByName("pispbe-stitch_output");
 	MediaEntity *ispStitchInput = isp->getEntityByName("pispbe-stitch_input");
-
-	/* Locate and open the cfe video streams. */
-	data->cfe_[Cfe::Output0] = RPi::Stream("CFE Image", cfeImage, StreamFlag::RequiresMmap);
-	data->cfe_[Cfe::Embedded] = RPi::Stream("CFE Embedded", cfeEmbedded);
-	data->cfe_[Cfe::Stats] = RPi::Stream("CFE Stats", cfeStats);
-	data->cfe_[Cfe::Config] = RPi::Stream("CFE Config", cfeConfig,
-					      StreamFlag::Recurrent | StreamFlag::RequiresMmap);
 
 	/* Tag the ISP input stream as an import stream. */
 	data->isp_[Isp::Input] =
@@ -1069,34 +1180,15 @@ int PipelineHandlerPiSP::platformRegister(std::unique_ptr<RPi::CameraData> &came
 								StreamFlag::Recurrent);
 
 	/* Wire up all the buffer connections. */
-	data->cfe_[Cfe::Output0].dev()->bufferReady.connect(data, &PiSPCameraData::cfeBufferDequeue);
-	data->cfe_[Cfe::Stats].dev()->bufferReady.connect(data, &PiSPCameraData::cfeBufferDequeue);
-	data->cfe_[Cfe::Config].dev()->bufferReady.connect(data, &PiSPCameraData::cfeBufferDequeue);
 	data->isp_[Isp::Input].dev()->bufferReady.connect(data, &PiSPCameraData::beInputDequeue);
 	data->isp_[Isp::Config].dev()->bufferReady.connect(data, &PiSPCameraData::beOutputDequeue);
 	data->isp_[Isp::Output0].dev()->bufferReady.connect(data, &PiSPCameraData::beOutputDequeue);
 	data->isp_[Isp::Output1].dev()->bufferReady.connect(data, &PiSPCameraData::beOutputDequeue);
-	data->cfe_[Cfe::Embedded].dev()->bufferReady.connect(data, &PiSPCameraData::cfeBufferDequeue);
-
-	data->csi2Subdev_ = std::make_unique<V4L2Subdevice>(cfe->getEntityByName("csi2"));
-	data->feSubdev_ = std::make_unique<V4L2Subdevice>(cfe->getEntityByName("pisp-fe"));
-	data->csi2Subdev_->open();
-	data->feSubdev_->open();
 
 	/*
-	 * Open all CFE and ISP streams. The exception is the embedded data
-	 * stream, which only gets opened below if the IPA reports that the sensor
-	 * supports embedded data.
-	 *
 	 * The below grouping is just for convenience so that we can easily
 	 * iterate over all streams in one go.
 	 */
-	data->streams_.push_back(&data->cfe_[Cfe::Output0]);
-	data->streams_.push_back(&data->cfe_[Cfe::Config]);
-	data->streams_.push_back(&data->cfe_[Cfe::Stats]);
-	if (data->sensorMetadata_)
-		data->streams_.push_back(&data->cfe_[Cfe::Embedded]);
-
 	data->streams_.push_back(&data->isp_[Isp::Input]);
 	data->streams_.push_back(&data->isp_[Isp::Output0]);
 	data->streams_.push_back(&data->isp_[Isp::Output1]);
@@ -1106,37 +1198,61 @@ int PipelineHandlerPiSP::platformRegister(std::unique_ptr<RPi::CameraData> &came
 	data->streams_.push_back(&data->isp_[Isp::StitchInput]);
 	data->streams_.push_back(&data->isp_[Isp::StitchOutput]);
 
-	for (auto stream : data->streams_) {
-		ret = stream->dev()->open();
-		if (ret)
-			return ret;
-	}
-
-	/* Write up all the IPA connections. */
-	data->ipa_->prepareIspComplete.connect(data, &PiSPCameraData::prepareIspComplete);
-	data->ipa_->processStatsComplete.connect(data, &PiSPCameraData::processStatsComplete);
-	data->ipa_->setCameraTimeout.connect(data, &PiSPCameraData::setCameraTimeout);
-
-	/*
-	 * List the available streams an application may request. At present, we
-	 * do not advertise CFE Embedded and ISP Statistics streams, as there
-	 * is no mechanism for the application to request non-image buffer formats.
-	 */
-	std::set<Stream *> streams;
-	streams.insert(&data->cfe_[Cfe::Output0]);
+	/* Applications may ask for these stream. */
 	streams.insert(&data->isp_[Isp::Output0]);
 	streams.insert(&data->isp_[Isp::Output1]);
 
+	return 0;
+}
+
+std::shared_ptr<Camera>
+PipelineHandlerPiSP::platformCreateCamera(std::unique_ptr<RPi::CameraData> &cameraData,
+					  MediaDevice *cfe, MediaDevice *isp)
+{
+	PiSPCameraData *data = static_cast<PiSPCameraData *>(cameraData.get());
+	int ret;
+	std::set<Stream *> streams;
+
+	/* cfe is a null pointer when making a memory camera that doesn't use the front end. */
+	if (cfe) {
+		ret = createCameraCfe(data, cfe, streams);
+		if (ret)
+			return nullptr;
+	}
+
+	ret = createCameraBe(data, isp, streams);
+	if (ret)
+		return nullptr;
+
+	/* All the streams must open successfully. */
+	for (auto stream : data->streams_) {
+		ret = stream->dev()->open();
+		if (ret)
+			return nullptr;
+	}
+
+	/* Wire up all the IPA connections. */
+	data->ipa_->prepareIspComplete.connect(data, &PiSPCameraData::prepareIspComplete);
+	data->ipa_->processStatsComplete.connect(data, &PiSPCameraData::processStatsComplete);
+
 	/* Create and register the camera. */
-	const std::string &id = data->sensor_->id();
+	const std::string &id = cfe ? data->sensor_->id() : "memory";
 	std::shared_ptr<Camera> camera =
 		Camera::create(std::move(cameraData), id, streams);
-	PipelineHandler::registerCamera(std::move(camera));
 
 	LOG(RPI, Info) << "Registered camera " << id
-		       << " to CFE device " << cfe->deviceNode()
+		       << (cfe ? " to CFE device " + cfe->deviceNode() : "")
 		       << " and ISP device " << isp->deviceNode()
 		       << " using PiSP variant " << data->pispVariant_.Name();
+
+	return camera;
+}
+
+int PipelineHandlerPiSP::platformRegister(std::unique_ptr<RPi::CameraData> &cameraData,
+					  MediaDevice *cfe, MediaDevice *isp)
+{
+	std::shared_ptr<Camera> camera = platformCreateCamera(cameraData, cfe, isp);
+	PipelineHandler::registerCamera(std::move(camera));
 
 	return 0;
 }
