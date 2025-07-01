@@ -72,6 +72,7 @@ public:
 
 	int loadPipelineConfiguration();
 	int loadIPA(ipa::RPi::InitResult *result);
+	int loadNamedIPA(std::string const &settings, ipa::RPi::InitResult *result);
 	int configureIPA(const CameraConfiguration *config, ipa::RPi::ConfigResult *result);
 	virtual int platformInitIpa(ipa::RPi::InitParams &params) = 0;
 	virtual int platformConfigureIpa(ipa::RPi::ConfigParams &params) = 0;
