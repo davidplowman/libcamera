@@ -846,6 +846,29 @@ void PipelineHandler::disconnect()
  */
 
 /**
+ * \fn PipelineHandler::supportsMemoryCamera()
+ * \brief Indicate whether this pipeline handler supports memory cameras
+ * \return True if the pipeline handler supports memory cameras, otherwise false
+ */
+
+/**
+ * \fn PipelineHandler::createMemoryCamera()
+ * \brief Create a memory camera to process raw camera images from a memory buffer
+ * \param[in] enumerator The enumerator providing all media devices found in the
+ * system
+ * \param[in] settings A string of settings that the pipeline handler should use
+ *
+ * The pipeline handler should create a memory camera, which an application can
+ * use to process raw camera images that are stored in memory buffers (rather
+ * than being delivered from a live camera).
+ *
+ * The settings should indicate exactly what processing the application requires
+ * to be performed on the raw image.
+ *
+ * \return Shared pointer to a camera, or a nullptr if none could be created
+ */
+
+/**
  * \class PipelineHandlerFactoryBase
  * \brief Base class for pipeline handler factories
  *

@@ -55,6 +55,9 @@ private:
 	void pipelineFactoryMatch(const PipelineHandlerFactoryBase *factory);
 	void cleanup() LIBCAMERA_TSA_EXCLUDES(mutex_);
 
+	std::shared_ptr<Camera> getMemoryCamera(const PipelineHandlerFactoryBase *factory,
+						std::string_view settings);
+
 	/*
 	 * This mutex protects
 	 *
@@ -69,6 +72,8 @@ private:
 	int status_ LIBCAMERA_TSA_GUARDED_BY(mutex_);
 
 	std::unique_ptr<DeviceEnumerator> enumerator_;
+
+	std::vector<std::string> memoryCameras_;
 
 	std::unique_ptr<IPAManager> ipaManager_;
 

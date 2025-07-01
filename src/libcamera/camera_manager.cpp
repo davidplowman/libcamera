@@ -155,6 +155,13 @@ void CameraManager::Private::pipelineFactoryMatch(const PipelineHandlerFactoryBa
 {
 	CameraManager *const o = LIBCAMERA_O_PTR();
 
+	/* First check for any memory-to-memory camera pipelines. */
+	{
+		std::shared_ptr<PipelineHandler> pipe = factory->create(o);
+		if (pipe->supportsMemoryCamera())
+			memoryCameras_.push_back(std::string(pipe->name()));
+	}
+
 	/* Provide as many matching pipelines as possible. */
 	while (1) {
 		std::shared_ptr<PipelineHandler> pipe = factory->create(o);
@@ -165,6 +172,19 @@ void CameraManager::Private::pipelineFactoryMatch(const PipelineHandlerFactoryBa
 			<< "Pipeline handler \"" << factory->name()
 			<< "\" matched";
 	}
+}
+
+std::shared_ptr<Camera> CameraManager::Private::getMemoryCamera(const PipelineHandlerFactoryBase *factory,
+								std::string_view settings)
+{
+	CameraManager *const o = LIBCAMERA_O_PTR();
+
+	std::shared_ptr<PipelineHandler> pipe = factory->create(o);
+
+	pipe->moveToThread(this);
+
+	return pipe->invokeMethod(&PipelineHandler::createMemoryCamera,
+				  ConnectionTypeBlocking, enumerator_.get(), settings);
 }
 
 void CameraManager::Private::cleanup()
@@ -371,6 +391,9 @@ void CameraManager::stop()
  * Before calling this function the caller is responsible for ensuring that
  * the camera manager is running.
  *
+ * This function does not list any memory cameras (for processing raw images
+ * held in memory buffers) that may be available.
+ *
  * \context This function is \threadsafe.
  *
  * \return List of all available cameras
@@ -404,6 +427,47 @@ std::shared_ptr<Camera> CameraManager::get(std::string_view id)
 	for (const std::shared_ptr<Camera> &camera : d->cameras_) {
 		if (camera->id() == id)
 			return camera;
+	}
+
+	return nullptr;
+}
+
+/**
+ * \brief List the pipeline handlers that support memory cameras
+ *
+ * Lists the pipeline handlers in the system that have indicated they
+ * support memory cameras. Memory cameras are used for processing raw
+ * camera images stored in memory buffers, where no corresponding
+ * camera is available.
+ *
+ * \return Vector of pipeline handler ids (strings)
+ */
+std::vector<std::string> CameraManager::memoryCameras() const
+{
+	return _d()->memoryCameras_;
+}
+
+/**
+ * \brief Get a memory camera from the named pipeline handler
+ * \param[in] id ID of the pipeline handler that should create the memory camera
+ *
+ * This function causes the named pipeline handler to create and return a
+ * memory camera to the application. Pipeline handlers may support multiple
+ * simultaneous memory cameras, or none at all.
+ *
+ * \return Shared pointer to Camera object or nullptr if no memory camera
+ * could be provided
+ */
+std::shared_ptr<Camera> CameraManager::getMemoryCamera(std::string_view id,
+						       std::string_view settings)
+{
+	for (const auto &name : _d()->memoryCameras_) {
+		if (name == id) {
+			const PipelineHandlerFactoryBase *factory;
+			factory = PipelineHandlerFactoryBase::getFactoryByName(name);
+
+			return _d()->getMemoryCamera(factory, settings);
+		}
 	}
 
 	return nullptr;
