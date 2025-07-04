@@ -280,8 +280,8 @@ SizeRange StreamFormats::range(const PixelFormat &pixelformat) const
  * handlers provide StreamFormats.
  */
 StreamConfiguration::StreamConfiguration()
-	: pixelFormat(0), stride(0), frameSize(0), bufferCount(0),
-	  stream_(nullptr)
+	: pixelFormat(0), stride(0), frameSize(0),
+	  direction(StreamDirection::Output), bufferCount(0), stream_(nullptr)
 {
 }
 
@@ -409,6 +409,8 @@ std::ostream &operator<<(std::ostream &out, const StreamConfiguration &cfg)
 {
 	out << cfg.size << "-" << cfg.pixelFormat << "/"
 	    << ColorSpace::toString(cfg.colorSpace);
+	if (cfg.direction == StreamDirection::Input)
+		out << "/" << "in";
 	return out;
 }
 
