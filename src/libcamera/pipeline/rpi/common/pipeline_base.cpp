@@ -393,12 +393,17 @@ PipelineHandlerBase::generateConfiguration(Camera *camera, Span<const StreamRole
 	V4L2VideoDevice::Formats fmts;
 	Size size;
 	std::optional<ColorSpace> colorSpace;
+	StreamDirection direction;
 
 	if (roles.empty())
 		return config;
 
-	Size sensorSize = data->sensor_->resolution();
+	Size sensorSize = Size(640, 480);
+	if (data->sensor_)
+		sensorSize = data->sensor_->resolution();
 	for (const StreamRole role : roles) {
+		direction = StreamDirection::Output;
+
 		switch (role) {
 		case StreamRole::Raw:
 			size = sensorSize;
@@ -408,6 +413,15 @@ PipelineHandlerBase::generateConfiguration(Camera *camera, Span<const StreamRole
 			ASSERT(pixelFormat.isValid());
 			colorSpace = ColorSpace::Raw;
 			bufferCount = 2;
+			break;
+
+		case StreamRole::RawInput:
+			size = sensorSize;
+			/* Placeholder value to prevent warnings, the application should override. */
+			pixelFormat = formats::SBGGR12;
+			colorSpace = ColorSpace::Raw;
+			bufferCount = 2;
+			direction = StreamDirection::Input;
 			break;
 
 		case StreamRole::StillCapture:
@@ -495,6 +509,7 @@ PipelineHandlerBase::generateConfiguration(Camera *camera, Span<const StreamRole
 		cfg.pixelFormat = pixelFormat;
 		cfg.colorSpace = colorSpace;
 		cfg.bufferCount = bufferCount;
+		cfg.direction = direction;
 		config->addConfiguration(cfg);
 	}
 
