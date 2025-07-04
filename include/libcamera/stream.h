@@ -37,6 +37,11 @@ private:
 	std::map<PixelFormat, std::vector<SizeRange>> formats_;
 };
 
+enum class StreamDirection {
+	Input,
+	Output
+};
+
 struct StreamConfiguration {
 	StreamConfiguration();
 	StreamConfiguration(const StreamFormats &formats);
@@ -46,6 +51,8 @@ struct StreamConfiguration {
 	unsigned int stride;
 	unsigned int frameSize;
 
+	StreamDirection direction;
+
 	unsigned int bufferCount;
 
 	std::optional<ColorSpace> colorSpace;
@@ -53,6 +60,8 @@ struct StreamConfiguration {
 	Stream *stream() const { return stream_; }
 	void setStream(Stream *stream) { stream_ = stream; }
 	const StreamFormats &formats() const { return formats_; }
+	bool isOutput() const { return direction == StreamDirection::Output; }
+	bool isInput() const { return direction == StreamDirection::Input; }
 
 	std::string toString() const;
 
@@ -68,6 +77,7 @@ enum class StreamRole {
 	StillCapture,
 	VideoRecording,
 	Viewfinder,
+	RawInput
 };
 
 std::ostream &operator<<(std::ostream &out, StreamRole role);
