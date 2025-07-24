@@ -48,6 +48,8 @@ public:
 
 	virtual CameraLens *focusLens() = 0;
 
+	virtual bool isMemory() const { return false; }
+
 	virtual const std::vector<unsigned int> &mbusCodes() const = 0;
 	virtual std::vector<Size> sizes(unsigned int mbusCode) const = 0;
 	virtual Size resolution() const = 0;
