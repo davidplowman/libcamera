@@ -331,6 +331,130 @@ std::ostream &operator<<(std::ostream &out, const BayerFormat &f)
 	return out;
 }
 
+const std::vector<std::pair<BayerFormat, unsigned int>> BayerToMbusCodeMap{
+	{
+		{ BayerFormat::BGGR, 8, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SBGGR8_1X8,
+	},
+	{
+		{ BayerFormat::GBRG, 8, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SGBRG8_1X8,
+	},
+	{
+		{ BayerFormat::GRBG, 8, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SGRBG8_1X8,
+	},
+	{
+		{ BayerFormat::RGGB, 8, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SRGGB8_1X8,
+	},
+	{
+		{ BayerFormat::BGGR, 10, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SBGGR10_1X10,
+	},
+	{
+		{ BayerFormat::GBRG, 10, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SGBRG10_1X10,
+	},
+	{
+		{ BayerFormat::GRBG, 10, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SGRBG10_1X10,
+	},
+	{
+		{ BayerFormat::RGGB, 10, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SRGGB10_1X10,
+	},
+	{
+		{ BayerFormat::BGGR, 12, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SBGGR12_1X12,
+	},
+	{
+		{ BayerFormat::GBRG, 12, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SGBRG12_1X12,
+	},
+	{
+		{ BayerFormat::GRBG, 12, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SGRBG12_1X12,
+	},
+	{
+		{ BayerFormat::RGGB, 12, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SRGGB12_1X12,
+	},
+	{
+		{ BayerFormat::BGGR, 14, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SBGGR14_1X14,
+	},
+	{
+		{ BayerFormat::GBRG, 14, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SGBRG14_1X14,
+	},
+	{
+		{ BayerFormat::GRBG, 14, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SGRBG14_1X14,
+	},
+	{
+		{ BayerFormat::RGGB, 14, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SRGGB14_1X14,
+	},
+	{
+		{ BayerFormat::BGGR, 16, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SBGGR16_1X16,
+	},
+	{
+		{ BayerFormat::GBRG, 16, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SGBRG16_1X16,
+	},
+	{
+		{ BayerFormat::GRBG, 16, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SGRBG16_1X16,
+	},
+	{
+		{ BayerFormat::RGGB, 16, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_SRGGB16_1X16,
+	},
+	{
+		{ BayerFormat::BGGR, 16, BayerFormat::Packing::PISP1 },
+		MEDIA_BUS_FMT_SBGGR16_1X16,
+	},
+	{
+		{ BayerFormat::GBRG, 16, BayerFormat::Packing::PISP1 },
+		MEDIA_BUS_FMT_SGBRG16_1X16,
+	},
+	{
+		{ BayerFormat::GRBG, 16, BayerFormat::Packing::PISP1 },
+		MEDIA_BUS_FMT_SGRBG16_1X16,
+	},
+	{
+		{ BayerFormat::RGGB, 16, BayerFormat::Packing::PISP1 },
+		MEDIA_BUS_FMT_SRGGB16_1X16,
+	},
+	{
+		{ BayerFormat::RGGB, 16, BayerFormat::Packing::PISP1 },
+		MEDIA_BUS_FMT_SRGGB16_1X16,
+	},
+	{
+		{ BayerFormat::MONO, 16, BayerFormat::Packing::None },
+		MEDIA_BUS_FMT_Y16_1X16,
+	},
+	{
+		{ BayerFormat::MONO, 16, BayerFormat::Packing::PISP1 },
+		MEDIA_BUS_FMT_Y16_1X16,
+	},
+};
+
+unsigned int BayerFormat::toMbusCode() const
+{
+	const auto it = std::find_if(BayerToMbusCodeMap.begin(), BayerToMbusCodeMap.end(),
+				     [this](const std::pair<BayerFormat, unsigned int> &match) {
+					     return *this == match.first;
+				     });
+
+	if (it != BayerToMbusCodeMap.end())
+		return it->second;
+
+	return 0;
+}
+
 /**
  * \fn bool operator!=(const BayerFormat &lhs, const BayerFormat &rhs)
  * \brief Compare two BayerFormats for inequality
