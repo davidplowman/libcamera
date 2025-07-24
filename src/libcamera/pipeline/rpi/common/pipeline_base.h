@@ -72,7 +72,8 @@ public:
 
 	int loadPipelineConfiguration();
 	int loadIPA(ipa::RPi::InitResult *result);
-	int loadNamedIPA(std::string const &settings, ipa::RPi::InitResult *result);
+	int loadNamedIPA(std::string const &settings, std::string const &sensorModel,
+			 ipa::RPi::InitResult *result);
 	int configureIPA(const CameraConfiguration *config, ipa::RPi::ConfigResult *result);
 	virtual int platformInitIpa(ipa::RPi::InitParams &params) = 0;
 	virtual int platformConfigureIpa(ipa::RPi::ConfigParams &params) = 0;
@@ -246,7 +247,7 @@ private:
 class RPiCameraConfiguration final : public CameraConfiguration
 {
 public:
-	RPiCameraConfiguration(const CameraData *data)
+	RPiCameraConfiguration(CameraData *data)
 		: CameraConfiguration(), data_(data)
 	{
 	}
@@ -288,7 +289,7 @@ public:
 	std::optional<ColorSpace> rgbColorSpace_;
 
 private:
-	const CameraData *data_;
+	CameraData *data_;
 };
 
 } /* namespace RPi */

@@ -192,6 +192,8 @@ int32_t IpaBase::init(const IPASettings &settings, const InitParams &params, Ini
 int32_t IpaBase::configure(const IPACameraSensorInfo &sensorInfo, const ConfigParams &params,
 			   ConfigResult *result)
 {
+	LOG(IPARPI, Debug) << "IpaBase::configure: model " << sensorInfo.model;
+
 	sensorCtrls_ = params.sensorControls;
 
 	if (!validateSensorControls()) {

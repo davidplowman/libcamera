@@ -820,6 +820,7 @@ private:
 	void prepareBe(uint32_t bufferId, bool stitchSwapBuffers);
 
 	void tryRunPipeline() override;
+	void runMemoryCamera();
 
 	struct CfeJob {
 		ControlList sensorControls;
@@ -985,8 +986,6 @@ std::shared_ptr<Camera>
 PipelineHandlerPiSP::createMemoryCamera(DeviceEnumerator *enumerator,
 					std::string_view settings)
 {
-	LOG(RPI, Info) << "PipelineHandlerPiSP::createMemoryCamera";
-
 	DeviceMatch isp("pispbe");
 	isp.add("pispbe-input");
 	isp.add("pispbe-config");
@@ -1002,19 +1001,23 @@ PipelineHandlerPiSP::createMemoryCamera(DeviceEnumerator *enumerator,
 		LOG(RPI, Warning) << "Unable to acquire ISP instance";
 		return nullptr;
 	}
-	LOG(RPI, Info) << "Found back-end ISP";
 
 	const libpisp::PiSPVariant *variant = nullptr;
 	if (!get_variant(ispDevice->hwRevision(), &variant)) {
 		LOG(RPI, Warning) << "Failed to find variant";
 		return nullptr;
 	}
-	LOG(RPI, Info) << "Found variant";
 
 	std::unique_ptr<RPi::CameraData> cameraData =
 		std::make_unique<PiSPCameraData>(this, *variant);
 	PiSPCameraData *pisp =
 		static_cast<PiSPCameraData *>(cameraData.get());
+
+	int ret = cameraData->loadPipelineConfiguration();
+	if (ret) {
+		LOG(RPI, Error) << "Unable to load pipeline configuration";
+		return nullptr;
+	}
 
 	/* Only need the back end, but creating the front end makes things easier */
 	pisp->fe_ = SharedMemObject<FrontEnd>
@@ -1026,7 +1029,7 @@ PipelineHandlerPiSP::createMemoryCamera(DeviceEnumerator *enumerator,
 		LOG(RPI, Error) << "Failed to create ISP shared objects";
 		return nullptr;
 	}
-	LOG(RPI, Info) << "Made camera data and shared BE config";
+	LOG(RPI, Debug) << "Made camera data and shared BE config";
 
 	/*
 	 * Next, we want to do PipelineHandlerBase::registerCamera, including:
@@ -1037,11 +1040,11 @@ PipelineHandlerPiSP::createMemoryCamera(DeviceEnumerator *enumerator,
 
 	/* loadIPA is a bit different for us as we have a filename */
 	ipa::RPi::InitResult result;
-	if (pisp->loadNamedIPA(std::string(settings), &result)) {
+	if (pisp->loadNamedIPA(std::string(settings), "default", &result)) {
 		LOG(RPI, Error) << "Failed to load a suitable IPA library";
 		return nullptr;
 	}
-	LOG(RPI, Info) << "Loaded IPA library!";
+	LOG(RPI, Info) << "Loaded IPA library " << settings;
 	
 	std::shared_ptr<Camera> camera = platformCreateCamera(cameraData, nullptr, ispDevice);
 
@@ -1099,6 +1102,7 @@ int PipelineHandlerPiSP::prepareBuffers(Camera *camera)
 			numBuffers = 0;
 		} else if (stream == &data->isp_[Isp::TdnOutput] && data->config_.disableTdn) {
 			/* TDN is explicitly disabled. */
+			LOG(RPI, Debug) << "TDN is disabled!";
 			continue;
 		} else if (stream == &data->isp_[Isp::StitchOutput] && data->config_.disableHdr) {
 			/* Stitch/HDR is explicitly disabled. */
@@ -1339,8 +1343,20 @@ PiSPCameraData::platformValidate(RPi::RPiCameraConfiguration *rpiConfig) const
 			status = CameraConfiguration::Adjusted;
 		}
 
-		rawStreams[0].format =
-			RPi::PipelineHandlerBase::toV4L2DeviceFormat(cfe_[Cfe::Output0].dev(), rawStream);
+		if (rawStreams[0].cfg->direction == StreamDirection::Input) {
+			LOG(RPI, Debug) << "rawStream format " << *rawStream;
+			V4L2DeviceFormat format;
+			format.fourcc = bayer.toV4L2PixelFormat();
+			LOG(RPI, Debug) << "fourcc " << format.fourcc;
+			format.size = rawStream->size;
+			format.colorSpace = ColorSpace::Raw;
+			rawStreams[0].format = format;
+			/* Someone might expect a real device here, but we can't use the CFE output. */
+			rawStreams[0].dev = isp_[Isp::Input].dev();
+			LOG(RPI, Debug) << "stream format now " << rawStreams[0].format;
+		} else
+			rawStreams[0].format =
+				RPi::PipelineHandlerBase::toV4L2DeviceFormat(rawStreams[0].dev, rawStream);
 
 		computeOptimalStride(rawStreams[0].format);
 	}
@@ -1370,6 +1386,8 @@ PiSPCameraData::platformValidate(RPi::RPiCameraConfiguration *rpiConfig) const
 		 * a downscaler block is available, or 16x when there's only the
 		 * resampler.
 		 */
+		LOG(RPI, Debug) << "sensorFormat " << rpiConfig->sensorFormat_
+				<< " cfg->size " << cfg->size;
 		Size rawSize = rpiConfig->sensorFormat_.size.boundedToAspectRatio(cfg->size);
 		unsigned int outputIndex = ispOutput == Isp::Output0 ? 0 : 1;
 		Size minSize;
@@ -1480,11 +1498,12 @@ int PiSPCameraData::platformPipelineConfigure(const std::unique_ptr<YamlObject> 
 	config_.numCfeConfigQueue =
 		phConfig["num_cfe_config_queue"].get<unsigned int>(config_.numCfeConfigQueue);
 	config_.disableTdn = phConfig["disable_tdn"].get<bool>(config_.disableTdn);
+	LOG(RPI, Debug) << "COnfig file - disableTdn is " << config_.disableTdn;
 	config_.disableHdr = phConfig["disable_hdr"].get<bool>(config_.disableHdr);
 
 	if (config_.disableTdn) {
 		LOG(RPI, Info) << "TDN disabled by user config";
-		streams_.erase(std::remove_if(streams_.begin(), streams_.end(),
+ 		streams_.erase(std::remove_if(streams_.begin(), streams_.end(),
 			       [this] (const RPi::Stream *s) { return s == &isp_[Isp::TdnInput] ||
 								      s == &isp_[Isp::TdnInput]; }),
 			       streams_.end());
@@ -1557,46 +1576,70 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 									 sensorFormatMod,
 									 BayerFormat::Packing::PISP1);
 		computeOptimalStride(cfeFormat);
+	} else if (rawStreams[0].cfg->direction == StreamDirection::Input) {
+		cfeFormat = rawStreams[0].format;
+		rawStreams[0].cfg->setStream(&isp_[Isp::Input]);
+		LOG(RPI, Debug) << "Input stream, format " << cfeFormat;
 	} else {
 		rawStreams[0].cfg->setStream(&cfe_[Cfe::Output0]);
 		cfe_[Cfe::Output0].setFlags(StreamFlag::External);
 		cfeFormat = rawStreams[0].format;
 	}
 
-	/*
-	 * If the sensor output is 16-bits, we must endian swap the buffer
-	 * contents to account for the HW missing this feature.
-	 */
-	cfe_[Cfe::Output0].clearFlags(StreamFlag::Needs16bitEndianSwap);
-	if (MediaBusFormatInfo::info(rpiConfig->sensorFormat_.code).bitsPerPixel == 16) {
-		cfe_[Cfe::Output0].setFlags(StreamFlag::Needs16bitEndianSwap);
-		LOG(RPI, Warning)
-			<< "The sensor is configured for a 16-bit output, statistics"
-			<< "  will not be correct. You must use manual camera settings.";
+	/* Don't configure the CFE when we're doing Bayer reprocessing. */
+	if (!rawStreams.empty() && rawStreams[0].cfg->direction != StreamDirection::Input) {
+
+		/*
+		 * If the sensor output is 16-bits, we must endian swap the buffer
+		 * contents to account for the HW missing this feature.
+		 */
+		cfe_[Cfe::Output0].clearFlags(StreamFlag::Needs16bitEndianSwap);
+		if (MediaBusFormatInfo::info(rpiConfig->sensorFormat_.code).bitsPerPixel == 16) {
+			cfe_[Cfe::Output0].setFlags(StreamFlag::Needs16bitEndianSwap);
+			LOG(RPI, Warning)
+				<< "The sensor is configured for a 16-bit output, statistics"
+				<< "  will not be correct. You must use manual camera settings.";
+		}
+
+		/* Ditto for the 14-bit unpacking. */
+		cfe_[Cfe::Output0].clearFlags(StreamFlag::Needs14bitUnpack);
+		if (MediaBusFormatInfo::info(rpiConfig->sensorFormat_.code).bitsPerPixel == 14) {
+			cfe_[Cfe::Output0].setFlags(StreamFlag::Needs14bitUnpack);
+			LOG(RPI, Warning)
+				<< "The sensor is configured for a 14-bit output, statistics"
+				<< "  will not be correct. You must use manual camera settings.";
+		}
+
+		ret = cfe->setFormat(&cfeFormat);
+		if (ret) {
+			LOG(RPI, Debug) << "PiSPCameraData::platformConfigure: exit " << ret;
+			return ret;
+		}
+
+		/* Set the TDN and Stitch node formats in case they are turned on. */
+		isp_[Isp::TdnOutput].dev()->setFormat(&cfeFormat);
+		isp_[Isp::TdnInput].dev()->setFormat(&cfeFormat);
+		isp_[Isp::StitchOutput].dev()->setFormat(&cfeFormat);
+		isp_[Isp::StitchInput].dev()->setFormat(&cfeFormat);
+
+		ret = isp_[Isp::Input].dev()->setFormat(&cfeFormat);
+		if (ret) {
+			LOG(RPI, Debug) << "PiSPCameraData::platformConfigure: exit " << ret;
+			return ret;
+		}
+	} else {
+		/* Set the TDN and Stitch node formats in case they are turned on. */
+		isp_[Isp::TdnOutput].dev()->setFormat(&cfeFormat);
+		isp_[Isp::TdnInput].dev()->setFormat(&cfeFormat);
+		isp_[Isp::StitchOutput].dev()->setFormat(&cfeFormat);
+		isp_[Isp::StitchInput].dev()->setFormat(&cfeFormat);
+
+		ret = isp_[Isp::Input].dev()->setFormat(&cfeFormat);
+		if (ret) {
+			LOG(RPI, Debug) << "PiSPCameraData::platformConfigure: exit " << ret;
+			return ret;
+		}
 	}
-
-	/* Ditto for the 14-bit unpacking. */
-	cfe_[Cfe::Output0].clearFlags(StreamFlag::Needs14bitUnpack);
-	if (MediaBusFormatInfo::info(rpiConfig->sensorFormat_.code).bitsPerPixel == 14) {
-		cfe_[Cfe::Output0].setFlags(StreamFlag::Needs14bitUnpack);
-		LOG(RPI, Warning)
-			<< "The sensor is configured for a 14-bit output, statistics"
-			<< "  will not be correct. You must use manual camera settings.";
-	}
-
-	ret = cfe->setFormat(&cfeFormat);
-	if (ret)
-		return ret;
-
-	/* Set the TDN and Stitch node formats in case they are turned on. */
-	isp_[Isp::TdnOutput].dev()->setFormat(&cfeFormat);
-	isp_[Isp::TdnInput].dev()->setFormat(&cfeFormat);
-	isp_[Isp::StitchOutput].dev()->setFormat(&cfeFormat);
-	isp_[Isp::StitchInput].dev()->setFormat(&cfeFormat);
-
-	ret = isp_[Isp::Input].dev()->setFormat(&cfeFormat);
-	if (ret)
-		return ret;
 
 	LOG(RPI, Info) << "Sensor: " << sensor_->id()
 		       << " - Selected sensor format: " << rpiConfig->sensorFormat_
@@ -1660,8 +1703,10 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 				<< format << " (sw downscale " << swDownscale << ")";
 
 		ret = stream->dev()->setFormat(&format);
-		if (ret)
+		if (ret) {
+			LOG(RPI, Debug) << "PiSPCameraData::platformConfigure: exit " << -EINVAL;
 			return -EINVAL;
+		}
 		LOG(RPI, Debug) << "After setFormat, stride " << format.planes[0].bpl;
 
 		if (format.size.height != cfg->size.height ||
@@ -1669,6 +1714,7 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 			LOG(RPI, Error)
 				<< "Failed to set requested format on " << stream->name()
 				<< ", returned " << format;
+			LOG(RPI, Debug) << "PiSPCameraData::platformConfigure: exit " << -EINVAL;
 			return -EINVAL;
 		}
 
@@ -1722,6 +1768,17 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 
 	beEnabled_ = beEnables & (PISP_BE_RGB_ENABLE_OUTPUT0 | PISP_BE_RGB_ENABLE_OUTPUT1);
 
+	/* For Bayer reprocessing, only enable the Back End. */
+	if (!rawStreams.empty() && rawStreams[0].cfg->direction == StreamDirection::Input) {
+		LOG(RPI, Debug) << "Re-processing use-case";
+		if (beEnabled_)
+			configureBe(rpiConfig->yuvColorSpace_);
+
+		LOG(RPI, Debug) << "PiSPCameraData::platformConfigure: exit " << 0;
+		return 0;
+
+	}
+
 	/* CFE statistics output format. */
 	format = {};
 	format.fourcc = V4L2PixelFormat(V4L2_META_FMT_RPI_FE_STATS);
@@ -1729,6 +1786,7 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 	if (ret) {
 		LOG(RPI, Error) << "Failed to set format on CFE stats stream: "
 				<< format.toString();
+		LOG(RPI, Debug) << "PiSPCameraData::platformConfigure: exit " << ret;
 		return ret;
 	}
 
@@ -1739,6 +1797,7 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 	if (ret) {
 		LOG(RPI, Error) << "Failed to set format on CFE config stream: "
 				<< format.toString();
+		LOG(RPI, Debug) << "PiSPCameraData::platformConfigure: exit " << ret;
 		return ret;
 	}
 
@@ -1758,6 +1817,7 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 		if (ret) {
 			LOG(RPI, Error) << "Failed to set format on CFE embedded: "
 					<< format;
+			LOG(RPI, Debug) << "PiSPCameraData::platformConfigure: exit " << ret;
 			return ret;
 		}
 	}
@@ -1768,6 +1828,7 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 	if (beEnabled_)
 		configureBe(rpiConfig->yuvColorSpace_);
 
+	LOG(RPI, Debug) << "PiSPCameraData::platformConfigure: exit " << 0;
 	return 0;
 }
 
@@ -1783,8 +1844,10 @@ void PiSPCameraData::platformStart()
 
 	cfeJobQueue_ = {};
 
-	for (unsigned int i = 0; i < config_.numCfeConfigQueue; i++)
-		prepareCfe();
+	if (sensor_->model() != "memory") {
+		for (unsigned int i = 0; i < config_.numCfeConfigQueue; i++)
+			prepareCfe();
+	}
 
 	/* Clear the debug dump file history. */
 	last_dump_file_.clear();
@@ -1881,6 +1944,7 @@ void PiSPCameraData::cfeBufferDequeue(FrameBuffer *buffer)
 
 void PiSPCameraData::beInputDequeue(FrameBuffer *buffer)
 {
+	LOG(RPI, Debug) << "PiSPCameraData::beInputDequeue: enter";
 	if (!isRunning())
 		return;
 
@@ -1889,12 +1953,14 @@ void PiSPCameraData::beInputDequeue(FrameBuffer *buffer)
 			<< ", timestamp: " << buffer->metadata().timestamp;
 
 	/* The ISP input buffer gets re-queued into CFE. */
-	handleStreamBuffer(buffer, &cfe_[Cfe::Output0]);
+	if (sensor_->model() != "memory")
+		handleStreamBuffer(buffer, &cfe_[Cfe::Output0]);
 	handleState();
 }
 
 void PiSPCameraData::beOutputDequeue(FrameBuffer *buffer)
 {
+	LOG(RPI, Debug) << "PiSPCameraData::beOutputDequeue: enter";
 	RPi::Stream *stream = nullptr;
 	int index;
 
@@ -1952,6 +2018,9 @@ void PiSPCameraData::processStatsComplete(const ipa::RPi::BufferIds &buffers)
 	if (!isRunning())
 		return;
 
+	if (sensor_->model() == "memory")
+		return;
+
 	handleStreamBuffer(cfe_[Cfe::Stats].getBuffers().at(buffers.stats & RPi::MaskID).buffer,
 			   &cfe_[Cfe::Stats]);
 }
@@ -1967,7 +2036,8 @@ void PiSPCameraData::setCameraTimeout(uint32_t maxFrameLengthMs)
 		std::max<utils::Duration>(1s, 5 * maxFrameLengthMs * 1ms);
 
 	LOG(RPI, Debug) << "Setting CFE timeout to " << timeout;
-	cfe_[Cfe::Output0].dev()->setDequeueTimeout(timeout);
+	if (sensor_->model() != "memory")
+		cfe_[Cfe::Output0].dev()->setDequeueTimeout(timeout);
 }
 
 void PiSPCameraData::prepareIspComplete(const ipa::RPi::BufferIds &buffers, bool stitchSwapBuffers)
@@ -1976,8 +2046,9 @@ void PiSPCameraData::prepareIspComplete(const ipa::RPi::BufferIds &buffers, bool
 	unsigned int bayerId = buffers.bayer & RPi::MaskID;
 	FrameBuffer *buffer;
 
-	if (!isRunning())
+	if (!isRunning()) {
 		return;
+	}
 
 	if (sensorMetadata_ && embeddedId) {
 		buffer = cfe_[Cfe::Embedded].getBuffers().at(embeddedId).buffer;
@@ -2359,7 +2430,14 @@ void PiSPCameraData::prepareCfe()
 
 void PiSPCameraData::prepareBe(uint32_t bufferId, bool stitchSwapBuffers)
 {
-	FrameBuffer *buffer = cfe_[Cfe::Output0].getBuffers().at(bufferId).buffer;
+	FrameBuffer *buffer;
+	if (sensor_->model() != "memory")
+		buffer = cfe_[Cfe::Output0].getBuffers().at(bufferId).buffer;
+	else {
+		Request *request = requestQueue_.front();
+		const libcamera::Stream *rawStream = &isp_[Isp::Input];
+		buffer = request->findBuffer(rawStream);
+	}
 
 	LOG(RPI, Debug) << "Input re-queue to ISP, buffer id " << bufferId
 			<< ", timestamp: " << buffer->metadata().timestamp;
@@ -2410,8 +2488,38 @@ void PiSPCameraData::prepareBe(uint32_t bufferId, bool stitchSwapBuffers)
 	isp_[Isp::Config].queueBuffer(config.buffer);
 }
 
+void PiSPCameraData::runMemoryCamera()
+{
+	Request *request = requestQueue_.front();
+
+	//applyScalerCrop(request->controls());
+
+	request->metadata().clear();
+
+	state_ = State::Busy;
+
+	ipa::RPi::PrepareParams params;
+	//params.buffers.bayer = RPi::MaskBayerData | bayerId;
+	//params.buffers.stats = RPi::MaskStats | statsId;
+	params.buffers.embedded = 0;
+	params.ipaContext = requestQueue_.front()->sequence();
+	//params.delayContext = job.delayContext;
+	//params.sensorControls = std::move(job.sensorControls);
+	params.requestControls = request->controls();
+
+	LOG(RPI, Debug) << "runMemoryCamera: call prepareIsp";
+	ipa_->prepareIsp(params);
+}
+
 void PiSPCameraData::tryRunPipeline()
 {
+	if (state_ == State::Idle && !requestQueue_.empty() && sensor_->model() == "memory") {
+
+		runMemoryCamera();
+
+		return;
+	}
+
 	/* If any of our request or buffer queues are empty, we cannot proceed. */
 	if (state_ != State::Idle || requestQueue_.empty() || !cfeJobComplete())
 		return;

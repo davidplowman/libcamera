@@ -20,6 +20,7 @@
 #include <libcamera/property_ids.h>
 
 #include "libcamera/internal/camera_lens.h"
+#include "libcamera/internal/camera_sensor_memory.h"
 #include "libcamera/internal/ipa_manager.h"
 #include "libcamera/internal/v4l2_subdevice.h"
 
@@ -153,10 +154,13 @@ CameraConfiguration::Status RPiCameraConfiguration::validateColorSpaces([[maybe_
 
 CameraConfiguration::Status RPiCameraConfiguration::validate()
 {
+	LOG(RPI, Debug) << "Enter RPiCameraConfiguration::validate";
 	Status status = Valid;
 
-	if (config_.empty())
+	if (config_.empty()) {
+		LOG(RPI, Debug) << "Exit RPiCameraConfiguration::validate - invalid";
 		return Invalid;
+	}
 
 	/*
 	 * Make sure that if a sensor configuration has been requested it
@@ -164,20 +168,11 @@ CameraConfiguration::Status RPiCameraConfiguration::validate()
 	 */
 	if (sensorConfig && !sensorConfig->isValid()) {
 		LOG(RPI, Error) << "Invalid sensor configuration request";
+		LOG(RPI, Debug) << "Exit RPiCameraConfiguration::validate - invalid";
 		return Invalid;
 	}
 
 	status = validateColorSpaces(ColorSpaceFlag::StreamsShareColorSpace);
-
-	/*
-	 * Validate the requested transform against the sensor capabilities and
-	 * rotation and store the final combined transform that configure() will
-	 * need to apply to the sensor to save us working it out again.
-	 */
-	Orientation requestedOrientation = orientation;
-	combinedTransform_ = data_->sensor_->computeTransform(&orientation);
-	if (orientation != requestedOrientation)
-		status = Adjusted;
 
 	rawStreams_.clear();
 	outStreams_.clear();
@@ -190,6 +185,26 @@ CameraConfiguration::Status RPiCameraConfiguration::validate()
 		else
 			outStreams_.emplace_back(outStreamIndex++, &cfg);
 	}
+
+	/*
+	 * Before going any further, let's check if it's a reprocessing setup, and
+	 * create a dummy "camera sensor" to match the input stream.
+	 */
+	if (rawStreams_[0].cfg->direction == StreamDirection::Input) {
+		LOG(RPI, Debug) << "Raw reprocessing use case for " << *rawStreams_[0].cfg;
+		data_->sensor_ = std::make_unique<CameraSensorMemory>(*rawStreams_[0].cfg);
+		LOG(RPI, Debug) << "Made CameraSensorMemory";
+	}
+
+	/*
+	 * Validate the requested transform against the sensor capabilities and
+	 * rotation and store the final combined transform that configure() will
+	 * need to apply to the sensor to save us working it out again.
+	 */
+	Orientation requestedOrientation = orientation;
+	combinedTransform_ = data_->sensor_->computeTransform(&orientation);
+	if (orientation != requestedOrientation)
+		status = Adjusted;
 
 	/* Sort the streams so the highest resolution is first. */
 	std::sort(rawStreams_.begin(), rawStreams_.end(),
@@ -216,7 +231,12 @@ CameraConfiguration::Status RPiCameraConfiguration::validate()
 		sensorSize = outStreams_[0].cfg->size;
 	}
 
-	sensorFormat_ = data_->findBestFormat(sensorSize, bitDepth);
+	if (rawStreams_[0].cfg->direction == StreamDirection::Input) {
+		std::vector<unsigned int> mbusCodes = data_->sensor_->mbusCodes();
+		Size size = data_->sensor_->resolution();
+		sensorFormat_ = data_->sensor_->getFormat(mbusCodes, size, size);
+	} else
+		sensorFormat_ = data_->findBestFormat(sensorSize, bitDepth);
 
 	/*
 	 * If a sensor configuration has been requested, it should apply
@@ -229,6 +249,7 @@ CameraConfiguration::Status RPiCameraConfiguration::validate()
 		    sensorFormat_.size != sensorConfig->outputSize) {
 			LOG(RPI, Error) << "Invalid sensor configuration: "
 					<< "bitDepth/size mismatch";
+			LOG(RPI, Debug) << "Exit RPiCameraConfiguration::validate - invalid";
 			return Invalid;
 		}
 	}
@@ -256,16 +277,20 @@ CameraConfiguration::Status RPiCameraConfiguration::validate()
 
 	/* Do any platform specific fixups. */
 	Status st = data_->platformValidate(this);
-	if (st == Invalid)
+	if (st == Invalid) {
+		LOG(RPI, Debug) << "Exit RPiCameraConfiguration::validate - invalid";
 		return Invalid;
+	}
 	else if (st == Adjusted)
 		status = Adjusted;
 
 	/* Further fixups on the RAW streams. */
 	for (auto &raw : rawStreams_) {
 		int ret = raw.dev->tryFormat(&raw.format);
-		if (ret)
+		if (ret) {
+			LOG(RPI, Debug) << "Exit RPiCameraConfiguration::validate - invalid";
 			return Invalid;
+		}
 
 		if (RPi::PipelineHandlerBase::updateStreamConfig(raw.cfg, raw.format))
 			status = Adjusted;
@@ -287,13 +312,17 @@ CameraConfiguration::Status RPiCameraConfiguration::validate()
 			<< "Try color space " << ColorSpace::toString(out.cfg->colorSpace);
 
 		int ret = out.dev->tryFormat(&out.format);
-		if (ret)
+		if (ret) {
+			LOG(RPI, Debug) << "Exit RPiCameraConfiguration::validate - invalid";
 			return Invalid;
+		}
 
 		if (RPi::PipelineHandlerBase::updateStreamConfig(out.cfg, out.format))
 			status = Adjusted;
 	}
 
+	LOG(RPI, Debug) << "raw format " << rawStreams_[0].format;
+	LOG(RPI, Debug) << "Exit RPiCameraConfiguration::validate - status " << status;
 	return status;
 }
 
@@ -346,6 +375,9 @@ bool PipelineHandlerBase::updateStreamConfig(StreamConfiguration *stream,
 
 	stream->stride = format.planes[0].bpl;
 	stream->frameSize = format.planes[0].size;
+	LOG(RPI, Debug) << "Update stream config with stride " << stream->stride
+			<< " colour space " << stream->colorSpace->toString()
+			<< " framesize " << stream->frameSize;
 
 	return adjusted;
 }
@@ -518,6 +550,7 @@ PipelineHandlerBase::generateConfiguration(Camera *camera, Span<const StreamRole
 
 int PipelineHandlerBase::configure(Camera *camera, CameraConfiguration *config)
 {
+	LOG(RPI, Debug) << "Enter PipelineHandlerBase::configure";
 	CameraData *data = cameraData(camera);
 	int ret;
 
@@ -536,15 +569,20 @@ int PipelineHandlerBase::configure(Camera *camera, CameraConfiguration *config)
 	V4L2SubdeviceFormat *sensorFormat = &rpiConfig->sensorFormat_;
 
 	if (rpiConfig->sensorConfig) {
+		LOG(RPI, Debug) << "Have sensor config " << rpiConfig->sensorConfig->bitDepth
+				<< " " << rpiConfig->sensorConfig->outputSize;
 		ret = data->sensor_->applyConfiguration(*rpiConfig->sensorConfig,
 							rpiConfig->combinedTransform_,
 							sensorFormat);
 	} else {
+		LOG(RPI, Debug) << "Setting sensorFormat " << *sensorFormat;
 		ret = data->sensor_->setFormat(sensorFormat,
 					       rpiConfig->combinedTransform_);
 	}
-	if (ret)
+	if (ret) {
+		LOG(RPI, Debug) << "Exit PipelineHandlerBase::configure " << ret;
 		return ret;
+	}
 
 	/*
 	 * Platform specific internal stream configuration. This also assigns
@@ -552,13 +590,16 @@ int PipelineHandlerBase::configure(Camera *camera, CameraConfiguration *config)
 	 */
 	data->cropParams_.clear();
 	ret = data->platformConfigure(rpiConfig);
-	if (ret)
+	if (ret) {
+		LOG(RPI, Debug) << "Exit PipelineHandlerBase::configure " << ret;
 		return ret;
+	}
 
 	ipa::RPi::ConfigResult result;
 	ret = data->configureIPA(config, &result);
 	if (ret) {
 		LOG(RPI, Error) << "Failed to configure the IPA: " << ret;
+		LOG(RPI, Debug) << "Exit PipelineHandlerBase::configure " << ret;
 		return ret;
 	}
 
@@ -634,6 +675,7 @@ int PipelineHandlerBase::configure(Camera *camera, CameraConfiguration *config)
 					<< " pad " << sinkPad->index()
 					<< " with format  " << *sensorFormat
 					<< ": " << ret;
+			LOG(RPI, Debug) << "Exit PipelineHandlerBase::configure " << ret;
 			return ret;
 		}
 
@@ -641,6 +683,7 @@ int PipelineHandlerBase::configure(Camera *camera, CameraConfiguration *config)
 				<< " on pad " << sinkPad->index();
 	}
 
+	LOG(RPI, Debug) << "Exit PipelineHandlerBase::configure " << 0;
 	return 0;
 }
 
@@ -707,11 +750,14 @@ int PipelineHandlerBase::start(Camera *camera, const ControlList *controls)
 	 * Reset the delayed controls with the gain and exposure values set by
 	 * the IPA.
 	 */
-	data->delayedCtrls_->reset(0);
-	data->state_ = CameraData::State::Idle;
+	if (data->delayedCtrls_) {
+		data->delayedCtrls_->reset(0);
 
-	/* Enable SOF event generation. */
-	data->frontendDevice()->setFrameStartEnabled(true);
+		/* Enable SOF event generation. */
+		data->frontendDevice()->setFrameStartEnabled(true);
+	}
+
+	data->state_ = CameraData::State::Idle;
 
 	data->platformStart();
 
@@ -738,7 +784,8 @@ void PipelineHandlerBase::stopDevice(Camera *camera)
 		stream->dev()->streamOff();
 
 	/* Disable SOF event generation. */
-	data->frontendDevice()->setFrameStartEnabled(false);
+	if (data->sensor_->entity())
+		data->frontendDevice()->setFrameStartEnabled(false);
 
 	data->clearIncompleteRequests();
 
@@ -1167,6 +1214,7 @@ int CameraData::loadIPA(ipa::RPi::InitResult *result)
 	if (isMonoSensor(sensor_))
 		model += "_mono";
 	std::string configurationFile = ipa_->configurationFile(model + ".json");
+	LOG(RPI, Debug) << "Loading IPA from " << configurationFile;
 
 	IPASettings settings(configurationFile, sensor_->model());
 	ipa::RPi::InitParams params;
@@ -1185,7 +1233,8 @@ int CameraData::loadIPA(ipa::RPi::InitResult *result)
 	return ipa_->init(settings, params, result);
 }
 
-int CameraData::loadNamedIPA(std::string const &tuningFile, ipa::RPi::InitResult *result)
+int CameraData::loadNamedIPA(std::string const &tuningFile, std::string const &sensorModel,
+			     ipa::RPi::InitResult *result)
 {
 	int ret;
 
@@ -1194,7 +1243,7 @@ int CameraData::loadNamedIPA(std::string const &tuningFile, ipa::RPi::InitResult
 	if (!ipa_)
 		return -ENOENT;
 
-	IPASettings settings(tuningFile, "imx219");
+	IPASettings settings(tuningFile, sensorModel);
 	ipa::RPi::InitParams params;
 
 	ret = platformInitIpa(params);
@@ -1223,12 +1272,19 @@ int CameraData::configureIPA(const CameraConfiguration *config, ipa::RPi::Config
 		LOG(RPI, Error) << "Failed to retrieve camera sensor info";
 		return ret;
 	}
+	LOG(RPI, Debug) << "Sensor Info:";
+	LOG(RPI, Debug) << "\tmodel: " << sensorInfo_.model;
+	LOG(RPI, Debug) << "\tbitsPerPixel: " << sensorInfo_.bitsPerPixel;
+	LOG(RPI, Debug) << "\tactiveAreaSize: " << sensorInfo_.activeAreaSize;
+	LOG(RPI, Debug) << "\tanalogCrop: " << sensorInfo_.analogCrop;
+	LOG(RPI, Debug) << "\toutputSize: " << sensorInfo_.outputSize;
 
 	/* Always send the user transform to the IPA. */
 	Transform transform = config->orientation / Orientation::Rotate0;
 	params.transform = static_cast<unsigned int>(transform);
 
 	/* Ready the IPA - it must know about the sensor resolution. */
+	LOG(RPI, Debug) << "ipa: " << ipa_.get();
 	ret = ipa_->configure(sensorInfo_, params, result);
 	if (ret < 0) {
 		LOG(RPI, Error) << "IPA configuration failed!";
@@ -1492,12 +1548,16 @@ void CameraData::handleState()
 void CameraData::checkRequestCompleted()
 {
 	Request *request = requestQueue_.front();
-	if (request->hasPendingBuffers())
+	if (request->hasPendingBuffers()) {
+		LOG(RPI, Debug) << "CameraData::checkRequestCompleted: has pending buffers";
 		return;
+	}
 
 	/* Must wait for metadata to be filled in before completing. */
-	if (state_ != State::IpaComplete)
+	if (state_ != State::IpaComplete) {
+		LOG(RPI, Debug) << "CameraData::checkRequestCompleted: state incomplete";
 		return;
+	}
 
 	LOG(RPI, Debug) << "Completing request sequence: "
 			<< request->sequence();

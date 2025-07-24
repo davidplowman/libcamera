@@ -354,7 +354,6 @@ void IpaPiSP::platformPrepareIsp([[maybe_unused]] const PrepareParams &params,
 			rpiMetadata.getLocked<BlackLevelStatus>("black_level.status");
 		if (blackLevelStatus)
 			applyBlackLevel(blackLevelStatus, global);
-
 	}
 
 	CacStatus *cacStatus = rpiMetadata.getLocked<CacStatus>("cac.status");
@@ -423,7 +422,10 @@ void IpaPiSP::platformPrepareIsp([[maybe_unused]] const PrepareParams &params,
 	be_->SetGlobal(global);
 
 	/* Save this for TDN and HDR on the next frame. */
-	lastExposure_ = deviceStatus->exposureTime * deviceStatus->analogueGain;
+	if (deviceStatus)
+		lastExposure_ = deviceStatus->exposureTime * deviceStatus->analogueGain;
+	else
+		lastExposure_ = 0s;
 
 	/* Lens control */
 	const AfStatus *afStatus = rpiMetadata.getLocked<AfStatus>("af.status");
