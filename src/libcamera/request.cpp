@@ -394,7 +394,9 @@ void Request::reuse(ReuseFlag flags)
 	if (flags & ReuseBuffers) {
 		for (const auto &[stream, buffer] : bufferMap_) {
 			buffer->_d()->setRequest(this);
-			_d()->pending_.insert(buffer);
+			/* Buffers in "input" streams don't complete. */
+			if (!stream->configuration().isInput())
+				_d()->pending_.insert(buffer);
 		}
 	} else {
 		bufferMap_.clear();
@@ -499,7 +501,9 @@ int Request::addBuffer(const Stream *stream, FrameBuffer *buffer,
 	}
 
 	buffer->_d()->setRequest(this);
-	_d()->pending_.insert(buffer);
+	/* Don't want to wait for input buffers as they don't "complete". */
+	if (!stream->configuration().isInput())
+		_d()->pending_.insert(buffer);
 
 	if (fence && fence->isValid())
 		buffer->_d()->setFence(std::move(fence));
