@@ -144,6 +144,8 @@ private:
 	} flickerState_;
 
 	bool cnnEnableInputTensor_;
+
+	bool isMemoryCamera_;
 };
 
 } /* namespace ipa::RPi */
