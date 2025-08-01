@@ -145,6 +145,8 @@ private:
 
 	bool cnnEnableInputTensor_;
 
+	bool awbEnabled_;
+
 	bool isMemoryCamera_;
 };
 
