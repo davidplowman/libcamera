@@ -727,15 +727,19 @@ int PipelineHandlerBase::start(Camera *camera, const ControlList *controls)
 	/* A good moment to add an initial clock sample. */
 	data->wallClockRecovery_.addSample();
 
-	/*
-	 * Reset the delayed controls with the gain and exposure values set by
-	 * the IPA.
-	 */
-	data->delayedCtrls_->reset(0);
-	data->state_ = CameraData::State::Idle;
+	/* A memory camera wouldn't have a front end device, so you would skip this. */
+	if (data->frontendDevice()) {
+		/*
+		 * Reset the delayed controls with the gain and exposure values set by
+		 * the IPA.
+		 */
+		data->delayedCtrls_->reset(0);
 
-	/* Enable SOF event generation. */
-	data->frontendDevice()->setFrameStartEnabled(true);
+		/* Enable SOF event generation. */
+		data->frontendDevice()->setFrameStartEnabled(true);
+	}
+
+	data->state_ = CameraData::State::Idle;
 
 	data->platformStart();
 
@@ -762,7 +766,8 @@ void PipelineHandlerBase::stopDevice(Camera *camera)
 		stream->dev()->streamOff();
 
 	/* Disable SOF event generation. */
-	data->frontendDevice()->setFrameStartEnabled(false);
+	if (data->frontendDevice())
+		data->frontendDevice()->setFrameStartEnabled(false);
 
 	data->clearIncompleteRequests();
 
