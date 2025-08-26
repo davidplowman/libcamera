@@ -20,6 +20,7 @@
 #include <libcamera/property_ids.h>
 
 #include "libcamera/internal/camera_lens.h"
+#include "libcamera/internal/camera_sensor_memory.h"
 #include "libcamera/internal/ipa_manager.h"
 #include "libcamera/internal/v4l2_subdevice.h"
 
@@ -170,15 +171,9 @@ CameraConfiguration::Status RPiCameraConfiguration::validate()
 	status = validateColorSpaces(ColorSpaceFlag::StreamsShareColorSpace);
 
 	/*
-	 * Validate the requested transform against the sensor capabilities and
-	 * rotation and store the final combined transform that configure() will
-	 * need to apply to the sensor to save us working it out again.
+	 * Separate the raw and output streams first, to make it easier to
+	 * detect the raw reprocessing use case.
 	 */
-	Orientation requestedOrientation = orientation;
-	combinedTransform_ = data_->sensor_->computeTransform(&orientation);
-	if (orientation != requestedOrientation)
-		status = Adjusted;
-
 	rawStreams_.clear();
 	outStreams_.clear();
 	unsigned int rawStreamIndex = 0;
@@ -190,6 +185,29 @@ CameraConfiguration::Status RPiCameraConfiguration::validate()
 		else
 			outStreams_.emplace_back(outStreamIndex++, &cfg);
 	}
+
+	/*
+	 * For the reprocessing use case, make a "memory camera" to match the
+	 * raw input buffer. This will make all the subsequent code run more like
+	 * the regular sensor case.
+	 */
+	if (rawStreams_[0].cfg->isInput()) {
+		LOG(RPI, Debug) << "Raw reprocessing use case for " << *rawStreams_[0].cfg;
+		data_->sensor_ = std::make_unique<CameraSensorMemory>(*rawStreams_[0].cfg);
+		/* We can fill in the only sensor format we support! */
+		auto const mbusCode = data_->sensor_->mbusCodes()[0];
+		data_->sensorFormats_.emplace(mbusCode, data_->sensor_->sizes(mbusCode));
+	}
+
+	/*
+	 * Validate the requested transform against the sensor capabilities and
+	 * rotation and store the final combined transform that configure() will
+	 * need to apply to the sensor to save us working it out again.
+	 */
+	Orientation requestedOrientation = orientation;
+	combinedTransform_ = data_->sensor_->computeTransform(&orientation);
+	if (orientation != requestedOrientation)
+		status = Adjusted;
 
 	/* Sort the streams so the highest resolution is first. */
 	std::sort(rawStreams_.begin(), rawStreams_.end(),

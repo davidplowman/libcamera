@@ -756,6 +756,10 @@ public:
 	bool adjustDeviceFormat(V4L2DeviceFormat &format) const;
 
 private:
+	int platformConfigureCfe(const RPi::RPiCameraConfiguration *rpiConfig,
+				 V4L2DeviceFormat &cfeFormat);
+	int platformConfigureIsp(const RPi::RPiCameraConfiguration *rpiConfig,
+				 V4L2DeviceFormat cfeFormat);
 	int platformConfigure(const RPi::RPiCameraConfiguration *rpiConfig) override;
 
 	int platformConfigureIpa([[maybe_unused]] ipa::RPi::ConfigParams &params) override
@@ -993,6 +997,12 @@ PipelineHandlerPiSP::createMemoryCamera(DeviceEnumerator *enumerator,
 	LOG(RPI, Info) << "Loaded IPA library " << configFile << " for memory camera";
 
 	std::shared_ptr<Camera> camera = platformCreateCamera(cameraData, nullptr, ispDevice);
+
+	int ret = pisp->loadPipelineConfiguration();
+	if (ret) {
+		LOG(RPI, Error) << "Unable to load pipeline configuration";
+		return nullptr;
+	}
 
 	return camera;
 }
@@ -1272,10 +1282,14 @@ PiSPCameraData::platformValidate(RPi::RPiCameraConfiguration *rpiConfig) const
 	}
 
 	if (!rawStreams.empty()) {
-		rawStreams[0].dev = cfe_[Cfe::Output0].dev();
-
 		StreamConfiguration *rawStream = rawStreams[0].cfg;
 		BayerFormat bayer = BayerFormat::fromPixelFormat(rawStream->pixelFormat);
+
+		if (rawStream->isInput())
+			rawStreams[0].dev = isp_[Isp::Input].dev();
+		else
+			rawStreams[0].dev = cfe_[Cfe::Output0].dev();
+
 		/*
 		 * We cannot output CSI2 packed or non 16-bit output from the frontend,
 		 * so signal the output as unpacked 16-bits in these cases.
@@ -1295,7 +1309,7 @@ PiSPCameraData::platformValidate(RPi::RPiCameraConfiguration *rpiConfig) const
 		}
 
 		rawStreams[0].format =
-			RPi::PipelineHandlerBase::toV4L2DeviceFormat(cfe_[Cfe::Output0].dev(), rawStream);
+			RPi::PipelineHandlerBase::toV4L2DeviceFormat(rawStreams[0].dev, rawStream);
 
 		computeOptimalStride(rawStreams[0].format);
 	}
@@ -1489,13 +1503,13 @@ bool PiSPCameraData::adjustDeviceFormat(V4L2DeviceFormat &format) const
 	return false;
 }
 
-int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConfig)
+int PiSPCameraData::platformConfigureCfe(const RPi::RPiCameraConfiguration *rpiConfig,
+					 V4L2DeviceFormat &cfeFormat)
 {
 	const std::vector<RPi::RPiCameraConfiguration::StreamParams> &rawStreams = rpiConfig->rawStreams_;
-	const std::vector<RPi::RPiCameraConfiguration::StreamParams> &outStreams = rpiConfig->outStreams_;
 	int ret;
 	V4L2VideoDevice *cfe = cfe_[Cfe::Output0].dev();
-	V4L2DeviceFormat cfeFormat;
+	V4L2DeviceFormat format;
 
 	/*
 	 * See which streams are requested, and route the user
@@ -1540,8 +1554,59 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 	}
 
 	ret = cfe->setFormat(&cfeFormat);
-	if (ret)
+
+	/* CFE statistics output format. */
+	format = {};
+	format.fourcc = V4L2PixelFormat(V4L2_META_FMT_RPI_FE_STATS);
+	ret = cfe_[Cfe::Stats].dev()->setFormat(&format);
+	if (ret) {
+		LOG(RPI, Error) << "Failed to set format on CFE stats stream: "
+				<< format.toString();
 		return ret;
+	}
+
+	/* CFE config format. */
+	format = {};
+	format.fourcc = V4L2PixelFormat(V4L2_META_FMT_RPI_FE_CFG);
+	ret = cfe_[Cfe::Config].dev()->setFormat(&format);
+	if (ret) {
+		LOG(RPI, Error) << "Failed to set format on CFE config stream: "
+				<< format.toString();
+		return ret;
+	}
+
+	/*
+	 * Configure the CFE embedded data output format only if the sensor
+	 * supports it.
+	 */
+	V4L2SubdeviceFormat embeddedFormat;
+	if (sensorMetadata_) {
+		sensor_->device()->getFormat(1, &embeddedFormat);
+		format = {};
+		format.fourcc = V4L2PixelFormat(V4L2_META_FMT_SENSOR_DATA);
+		format.planes[0].size = embeddedFormat.size.width * embeddedFormat.size.height;
+
+		LOG(RPI, Debug) << "Setting embedded data format " << format.toString();
+		ret = cfe_[Cfe::Embedded].dev()->setFormat(&format);
+		if (ret) {
+			LOG(RPI, Error) << "Failed to set format on CFE embedded: "
+					<< format;
+			return ret;
+		}
+	}
+
+	configureEntities(rpiConfig->sensorFormat_, embeddedFormat);
+	configureCfe();
+
+	return 0;
+}
+
+int PiSPCameraData::platformConfigureIsp(const RPi::RPiCameraConfiguration *rpiConfig,
+					 V4L2DeviceFormat cfeFormat)
+{
+	int ret;
+
+	const std::vector<RPi::RPiCameraConfiguration::StreamParams> &outStreams = rpiConfig->outStreams_;
 
 	/* Set the TDN and Stitch node formats in case they are turned on. */
 	isp_[Isp::TdnOutput].dev()->setFormat(&cfeFormat);
@@ -1677,53 +1742,35 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 
 	beEnabled_ = beEnables & (PISP_BE_RGB_ENABLE_OUTPUT0 | PISP_BE_RGB_ENABLE_OUTPUT1);
 
-	/* CFE statistics output format. */
-	format = {};
-	format.fourcc = V4L2PixelFormat(V4L2_META_FMT_RPI_FE_STATS);
-	ret = cfe_[Cfe::Stats].dev()->setFormat(&format);
-	if (ret) {
-		LOG(RPI, Error) << "Failed to set format on CFE stats stream: "
-				<< format.toString();
-		return ret;
-	}
-
-	/* CFE config format. */
-	format = {};
-	format.fourcc = V4L2PixelFormat(V4L2_META_FMT_RPI_FE_CFG);
-	ret = cfe_[Cfe::Config].dev()->setFormat(&format);
-	if (ret) {
-		LOG(RPI, Error) << "Failed to set format on CFE config stream: "
-				<< format.toString();
-		return ret;
-	}
-
-	/*
-	 * Configure the CFE embedded data output format only if the sensor
-	 * supports it.
-	 */
-	V4L2SubdeviceFormat embeddedFormat;
-	if (sensorMetadata_) {
-		sensor_->device()->getFormat(1, &embeddedFormat);
-		format = {};
-		format.fourcc = V4L2PixelFormat(V4L2_META_FMT_SENSOR_DATA);
-		format.planes[0].size = embeddedFormat.size.width * embeddedFormat.size.height;
-
-		LOG(RPI, Debug) << "Setting embedded data format " << format.toString();
-		ret = cfe_[Cfe::Embedded].dev()->setFormat(&format);
-		if (ret) {
-			LOG(RPI, Error) << "Failed to set format on CFE embedded: "
-					<< format;
-			return ret;
-		}
-	}
-
-	configureEntities(rpiConfig->sensorFormat_, embeddedFormat);
-	configureCfe();
-
 	if (beEnabled_)
 		configureBe(rpiConfig->yuvColorSpace_);
 
 	return 0;
+}
+
+int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConfig)
+{
+	/* What we call the cfeFormat here is also the input format for the ISP (Back End). */
+	V4L2DeviceFormat cfeFormat;
+
+	/*
+	 * First configure the CFE (if it's being used). In the case of memory cameras
+	 * (Bayer reprocessing), there's no CFE but the raw input stream should already
+	 * contain the correct ISP input format.
+	 */
+	if (cfe_[Cfe::Output0].dev()) {
+		/* Regular sensor. */
+		int ret = platformConfigureCfe(rpiConfig, cfeFormat);
+		if (ret)
+			return ret;
+	} else {
+		/* Memory camera. */
+		cfeFormat = rpiConfig->rawStreams_[0].format;
+		rpiConfig->rawStreams_[0].cfg->setStream(&isp_[Isp::Input]);
+	}
+
+	/* Finally configure the back end ISP. */
+	return platformConfigureIsp(rpiConfig, cfeFormat);
 }
 
 void PiSPCameraData::platformStart()
