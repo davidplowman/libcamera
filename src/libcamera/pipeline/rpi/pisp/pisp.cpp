@@ -780,6 +780,7 @@ private:
 	void prepareCfe();
 	void prepareBe(uint32_t bufferId, bool stitchSwapBuffers);
 
+	void runMemoryCamera();
 	void tryRunPipeline() override;
 
 	struct CfeJob {
@@ -1244,7 +1245,9 @@ PipelineHandlerPiSP::platformCreateCamera(std::unique_ptr<RPi::CameraData> &came
 
 	/* Wire up all the IPA connections. */
 	data->ipa_->prepareIspComplete.connect(data, &PiSPCameraData::prepareIspComplete);
-	data->ipa_->processStatsComplete.connect(data, &PiSPCameraData::processStatsComplete);
+	/* Connect IPA stats for hardware cameras; memory cams don't need it. */
+	if (cfe)
+		data->ipa_->processStatsComplete.connect(data, &PiSPCameraData::processStatsComplete);
 
 	/* Create and register the camera. */
 	const std::string &id = cfe ? data->sensor_->id() : "memory";
@@ -1787,8 +1790,11 @@ void PiSPCameraData::platformStart()
 
 	cfeJobQueue_ = {};
 
-	for (unsigned int i = 0; i < config_.numCfeConfigQueue; i++)
-		prepareCfe();
+	/* A memory camera wouldn't be using the CFE. */
+	if (cfe_[Cfe::Output0].dev()) {
+		for (unsigned int i = 0; i < config_.numCfeConfigQueue; i++)
+			prepareCfe();
+	}
 
 	/* Clear the debug dump file history. */
 	last_dump_file_.clear();
@@ -1892,8 +1898,12 @@ void PiSPCameraData::beInputDequeue(FrameBuffer *buffer)
 			<< ", buffer id " << cfe_[Cfe::Output0].getBufferId(buffer)
 			<< ", timestamp: " << buffer->metadata().timestamp;
 
-	/* The ISP input buffer gets re-queued into CFE. */
-	handleStreamBuffer(buffer, &cfe_[Cfe::Output0]);
+	/*
+	 * The ISP input buffer gets re-queued into CFE (but not for memory cameras
+	 * that aren't using the CFE).
+	 */
+	if (cfe_[Cfe::Output0].dev())
+		handleStreamBuffer(buffer, &cfe_[Cfe::Output0]);
 	handleState();
 }
 
@@ -2363,7 +2373,23 @@ void PiSPCameraData::prepareCfe()
 
 void PiSPCameraData::prepareBe(uint32_t bufferId, bool stitchSwapBuffers)
 {
-	FrameBuffer *buffer = cfe_[Cfe::Output0].getBuffers().at(bufferId).buffer;
+	FrameBuffer *buffer;
+	if (!sensor_->isMemory())
+		buffer = cfe_[Cfe::Output0].getBuffers().at(bufferId).buffer;
+	else {
+		/* Memory camera. Back end input buffer is in the request. */
+		Request *request = requestQueue_.front();
+		const libcamera::Stream *rawStream = &isp_[Isp::Input];
+		buffer = request->findBuffer(rawStream);
+		/* If there's no buffer to process, there's no recovering from that. */
+		if (!buffer)
+			LOG(RPI, Fatal) << "No input buffer supplied for re-processing";
+		/*
+		 * Can't see how an application would set bytesused if it were different
+		 * from the allocated size (length), so assume that's the number we need.
+		 */
+		buffer->_d()->metadata().planes()[0].bytesused = buffer->planes()[0].length;
+	}
 
 	LOG(RPI, Debug) << "Input re-queue to ISP, buffer id " << bufferId
 			<< ", timestamp: " << buffer->metadata().timestamp;
@@ -2414,8 +2440,32 @@ void PiSPCameraData::prepareBe(uint32_t bufferId, bool stitchSwapBuffers)
 	isp_[Isp::Config].queueBuffer(config.buffer);
 }
 
+void PiSPCameraData::runMemoryCamera()
+{
+	Request *request = requestQueue_.front();
+	ASSERT(request->metadata().empty());
+
+	applyScalerCrop(request->controls());
+
+	state_ = State::Busy;
+
+	ipa::RPi::PrepareParams params;
+	params.buffers.embedded = 0;
+	params.ipaContext = requestQueue_.front()->sequence();
+	params.requestControls = request->controls();
+
+	LOG(RPI, Debug) << "runMemoryCamera: call prepareIsp";
+	ipa_->prepareIsp(params);
+}
+
 void PiSPCameraData::tryRunPipeline()
 {
+	if (state_ == State::Idle && !requestQueue_.empty() && sensor_->isMemory()) {
+		runMemoryCamera();
+
+		return;
+	}
+
 	/* If any of our request or buffer queues are empty, we cannot proceed. */
 	if (state_ != State::Idle || requestQueue_.empty() || !cfeJobComplete())
 		return;
