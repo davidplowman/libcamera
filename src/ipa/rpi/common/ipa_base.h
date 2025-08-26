@@ -45,6 +45,9 @@ public:
 	void mapBuffers(const std::vector<IPABuffer> &buffers) override;
 	void unmapBuffers(const std::vector<unsigned int> &ids) override;
 
+	void prepareIspFillMetadata(const PrepareParams &params, unsigned int ipaContext,
+				    Span<uint8_t> &embeddedBuffer, bool &hdrChange);
+
 	void prepareIsp(const PrepareParams &params) override;
 	void processStats(const ProcessParams &params) override;
 
@@ -142,6 +145,8 @@ private:
 		int32_t mode;
 		utils::Duration manualPeriod;
 	} flickerState_;
+
+	bool isMemoryCamera_;
 
 	bool cnnEnableInputTensor_;
 

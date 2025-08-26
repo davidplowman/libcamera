@@ -194,6 +194,8 @@ int32_t IpaBase::init(const IPASettings &settings, const InitParams &params, Ini
 int32_t IpaBase::configure(const IPACameraSensorInfo &sensorInfo, const ConfigParams &params,
 			   ConfigResult *result)
 {
+	isMemoryCamera_ = sensorInfo.model == "memory";
+
 	sensorCtrls_ = params.sensorControls;
 
 	if (!validateSensorControls()) {
@@ -308,10 +310,13 @@ void IpaBase::start(const ControlList &controls, StartResult *result)
 	/*
 	 * SwitchMode may supply updated exposure/gain values to use.
 	 * agcStatus_ will store these values for us to use until delayed_status values
-	 * start to appear.
+	 * start to appear. Initialise digital gain to 1, as we'll otherwise end up with
+	 * completely black output if AGC isn't running (which is unusual, but does
+	 * happen with memory cameras).
 	 */
 	agcStatus_.exposureTime = 0.0s;
 	agcStatus_.analogueGain = 0.0;
+	agcStatus_.digitalGain = 1.0;
 
 	metadata.get("agc.status", agcStatus_);
 	if (agcStatus_.exposureTime && agcStatus_.analogueGain) {
@@ -415,6 +420,75 @@ void IpaBase::unmapBuffers(const std::vector<unsigned int> &ids)
 	}
 }
 
+void IpaBase::prepareIspFillMetadata(const PrepareParams &params, unsigned int ipaContext,
+				     Span<uint8_t> &embeddedBuffer, bool &hdrChange)
+{
+	RPiController::Metadata &rpiMetadata = rpiMetadata_[ipaContext];
+
+	rpiMetadata.clear();
+	hdrChange = false;
+
+	if (!isMemoryCamera_) {
+		/*
+		 * Regular cameras need to get the device status from the sensor, find the
+		 * appropriate embedded data buffers (if any), and so forth.
+		 */
+		fillDeviceStatus(params.sensorControls, ipaContext);
+		fillSyncParams(params, ipaContext);
+
+		if (params.buffers.embedded) {
+			/*
+			 * Pipeline handler has supplied us with an embedded data buffer,
+			 * we must pass it to the CamHelper for parsing.
+			 */
+			auto it = buffers_.find(params.buffers.embedded);
+			ASSERT(it != buffers_.end());
+			embeddedBuffer = it->second.planes()[0];
+		}
+
+		/*
+		 * AGC wants to know the algorithm status from the time it actioned the
+		 * sensor exposure/gain changes. So fetch it from the metadata list
+		 * indexed by the IPA cookie returned, and put it in the current frame
+		 * metadata.
+		 *
+		 * Note if the HDR mode has changed, as things like tonemaps may need updating.
+		 */
+		AgcStatus agcStatus;
+		RPiController::Metadata &delayedMetadata = rpiMetadata_[params.delayContext];
+		if (!delayedMetadata.get<AgcStatus>("agc.status", agcStatus)) {
+			rpiMetadata.set("agc.delayed_status", agcStatus);
+			hdrChange = agcStatus.hdr.mode != hdrStatus_.mode;
+			hdrStatus_ = agcStatus.hdr;
+		}
+	} else {
+		/*
+		 * Memory cameras make the device status from exposure/gain information passed
+		 * in the request controls. Making a "fake" device status like this will cause
+		 * the correct values to be used to set up all the tuning algorithms for this
+		 * frame.
+		 */
+		DeviceStatus deviceStatus = {};
+
+		const auto exposureTime = params.requestControls.get(controls::ExposureTime);
+		if (exposureTime)
+			deviceStatus.exposureTime = Duration(*exposureTime * 1000);
+		else
+			deviceStatus.exposureTime = Duration(1ms);
+
+		const auto analogueGain = params.requestControls.get(controls::AnalogueGain);
+		if (analogueGain)
+			deviceStatus.analogueGain = *analogueGain;
+		else
+			deviceStatus.analogueGain = 1.0;
+
+		LOG(IPARPI, Debug) << "Exposure time " << deviceStatus.exposureTime
+				   << " AG " << deviceStatus.analogueGain;
+
+		rpiMetadata.set("device.status", deviceStatus);
+	}
+}
+
 void IpaBase::prepareIsp(const PrepareParams &params)
 {
 	applyControls(params.requestControls);
@@ -428,37 +502,14 @@ void IpaBase::prepareIsp(const PrepareParams &params)
 	unsigned int ipaContext = params.ipaContext % rpiMetadata_.size();
 	RPiController::Metadata &rpiMetadata = rpiMetadata_[ipaContext];
 	Span<uint8_t> embeddedBuffer;
-
-	rpiMetadata.clear();
-	fillDeviceStatus(params.sensorControls, ipaContext);
-	fillSyncParams(params, ipaContext);
-
-	if (params.buffers.embedded) {
-		/*
-		 * Pipeline handler has supplied us with an embedded data buffer,
-		 * we must pass it to the CamHelper for parsing.
-		 */
-		auto it = buffers_.find(params.buffers.embedded);
-		ASSERT(it != buffers_.end());
-		embeddedBuffer = it->second.planes()[0];
-	}
+	bool hdrChange;
 
 	/*
-	 * AGC wants to know the algorithm status from the time it actioned the
-	 * sensor exposure/gain changes. So fetch it from the metadata list
-	 * indexed by the IPA cookie returned, and put it in the current frame
-	 * metadata.
-	 *
-	 * Note if the HDR mode has changed, as things like tonemaps may need updating.
+	 * This call fills in certain metadata items that subsequent calls to prepare
+	 * will expect to find. Note that different things happen here for regular
+	 * sensors and "memory cameras".
 	 */
-	AgcStatus agcStatus;
-	bool hdrChange = false;
-	RPiController::Metadata &delayedMetadata = rpiMetadata_[params.delayContext];
-	if (!delayedMetadata.get<AgcStatus>("agc.status", agcStatus)) {
-		rpiMetadata.set("agc.delayed_status", agcStatus);
-		hdrChange = agcStatus.hdr.mode != hdrStatus_.mode;
-		hdrStatus_ = agcStatus.hdr;
-	}
+	prepareIspFillMetadata(params, ipaContext, embeddedBuffer, hdrChange);
 
 	/*
 	 * This may overwrite the DeviceStatus using values from the sensor
@@ -648,6 +699,18 @@ void IpaBase::setMode(const IPACameraSensorInfo &sensorInfo)
 	 */
 	mode_.sensitivity = helper_->getModeSensitivity(mode_);
 
+	if (isMemoryCamera_) {
+		/*
+		 * For memory cameras, the min/max gain/exposure doesn't make much
+		 * sense (and our "sensor" won't have any V4L2 controls), but we do
+		 * need to set the camera mode information that we have so far, so
+		 * that the control algorithms will see it.
+		 */
+		helper_->setCameraMode(mode_);
+
+		return;
+	}
+
 	const ControlInfo &gainCtrl = sensorCtrls_.at(V4L2_CID_ANALOGUE_GAIN);
 	const ControlInfo &exposureTimeCtrl = sensorCtrls_.at(V4L2_CID_EXPOSURE);
 
@@ -688,6 +751,10 @@ void IpaBase::setCameraTimeoutValue()
 
 bool IpaBase::validateSensorControls()
 {
+	/* Don't need any of these controls with memory cameras. */
+	if (isMemoryCamera_)
+		return true;
+
 	static const uint32_t ctrls[] = {
 		V4L2_CID_ANALOGUE_GAIN,
 		V4L2_CID_EXPOSURE,
@@ -953,6 +1020,11 @@ void IpaBase::applyControls(const ControlList &controls)
 		case controls::EXPOSURE_TIME: {
 			RPiController::AgcAlgorithm *agc = dynamic_cast<RPiController::AgcAlgorithm *>(
 				controller_.getAlgorithm("agc"));
+
+			/* Don't print a "no AGC" warning if this is a memory camera. */
+			if (!agc && isMemoryCamera_)
+				break;
+
 			if (!agc) {
 				LOG(IPARPI, Warning)
 					<< "Could not set EXPOSURE_TIME - no AGC algorithm";
@@ -979,6 +1051,11 @@ void IpaBase::applyControls(const ControlList &controls)
 		case controls::ANALOGUE_GAIN: {
 			RPiController::AgcAlgorithm *agc = dynamic_cast<RPiController::AgcAlgorithm *>(
 				controller_.getAlgorithm("agc"));
+
+			/* Don't print a "no AGC" warning if this is a memory camera. */
+			if (!agc && isMemoryCamera_)
+				break;
+
 			if (!agc) {
 				LOG(IPARPI, Warning)
 					<< "Could not set ANALOGUE_GAIN - no AGC algorithm";
