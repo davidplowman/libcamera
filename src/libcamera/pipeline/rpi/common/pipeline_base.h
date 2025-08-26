@@ -264,7 +264,7 @@ private:
 class RPiCameraConfiguration final : public CameraConfiguration
 {
 public:
-	RPiCameraConfiguration(const CameraData *data)
+	RPiCameraConfiguration(CameraData *data)
 		: CameraConfiguration(), data_(data)
 	{
 	}
@@ -306,7 +306,7 @@ public:
 	std::optional<ColorSpace> rgbColorSpace_;
 
 private:
-	const CameraData *data_;
+	CameraData *data_;
 };
 
 } /* namespace RPi */
