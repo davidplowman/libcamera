@@ -30,6 +30,8 @@ public:
 
 	void handleRequestCompleted(Request *req);
 
+	std::shared_ptr<Camera> getMemoryCamera(std::string_view id, std::string_view settings);
+
 private:
 	std::unique_ptr<CameraManager> cameraManager_;
 

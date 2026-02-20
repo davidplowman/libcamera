@@ -21,7 +21,8 @@ void init_py_enums(py::module &m)
 		.value("StillCapture", StreamRole::StillCapture)
 		.value("Raw", StreamRole::Raw)
 		.value("VideoRecording", StreamRole::VideoRecording)
-		.value("Viewfinder", StreamRole::Viewfinder);
+		.value("Viewfinder", StreamRole::Viewfinder)
+		.value("RawInput", StreamRole::RawInput);
 
 	py::enum_<ControlType>(m, "ControlType")
 		.value("Null", ControlType::ControlTypeNone)
@@ -44,4 +45,8 @@ void init_py_enums(py::module &m)
 		.value("Rotate270", Orientation::Rotate270)
 		.value("Rotate270Mirror", Orientation::Rotate270Mirror)
 		.value("Rotate90", Orientation::Rotate90);
+
+	py::enum_<StreamDirection>(m, "StreamDirection")
+		.value("Input", StreamDirection::Input)
+		.value("Output", StreamDirection::Output);
 }

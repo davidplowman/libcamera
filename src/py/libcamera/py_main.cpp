@@ -154,7 +154,8 @@ PYBIND11_MODULE(_libcamera, m)
 		.def_property_readonly("cameras", &PyCameraManager::cameras)
 
 		.def_property_readonly("event_fd", &PyCameraManager::eventFd)
-		.def("get_ready_requests", &PyCameraManager::getReadyRequests);
+		.def("get_ready_requests", &PyCameraManager::getReadyRequests)
+		.def("get_memory_camera", &PyCameraManager::getMemoryCamera, py::keep_alive<0, 1>());
 
 	pyCamera
 		.def_property_readonly("id", &Camera::id)
@@ -344,6 +345,7 @@ PYBIND11_MODULE(_libcamera, m)
 		.def_readwrite("pixel_format", &StreamConfiguration::pixelFormat)
 		.def_readwrite("stride", &StreamConfiguration::stride)
 		.def_readwrite("frame_size", &StreamConfiguration::frameSize)
+		.def_readwrite("direction", &StreamConfiguration::direction)
 		.def_readwrite("buffer_count", &StreamConfiguration::bufferCount)
 		.def_property_readonly("formats", &StreamConfiguration::formats,
 				       py::return_value_policy::reference_internal)

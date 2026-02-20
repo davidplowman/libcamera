@@ -128,3 +128,9 @@ std::vector<Request *> PyCameraManager::getCompletedRequests()
 	swap(v, completedRequests_);
 	return v;
 }
+
+std::shared_ptr<Camera> PyCameraManager::getMemoryCamera(std::string_view id, std::string_view settings)
+{
+	std::shared_ptr<Camera> memory_cam = cameraManager_->getMemoryCamera(id, settings);
+	return memory_cam;
+}
