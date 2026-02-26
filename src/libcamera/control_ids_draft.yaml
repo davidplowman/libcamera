@@ -124,6 +124,15 @@ controls:
           value: 1
           description: The lens shading map mode is available.
 
+  - LensShadingStrength:
+      type: float
+      direction: inout
+      description: |
+       Control the strength of the lens shading luminance correction. A
+       value of 0 means no luminance correction is applied, and a value of
+       1 applies full luminance correction. Pipeline handlers may accept
+       values greater than 1.
+
   - PipelineDepth:
       type: int32_t
       direction: out

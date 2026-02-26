@@ -115,6 +115,7 @@ public:
 	int read(const libcamera::ValueNode &params) override;
 	void prepare(Metadata *imageMetadata) override;
 	void process(StatisticsPtr &stats, Metadata *imageMetadata) override;
+	void setStrength(double strength);
 
 private:
 	/* configuration is read-only, and available to both threads */

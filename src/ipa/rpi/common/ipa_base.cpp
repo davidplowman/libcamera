@@ -27,6 +27,7 @@
 #include "controller/denoise_algorithm.h"
 #include "controller/hdr_algorithm.h"
 #include "controller/lux_status.h"
+#include "controller/rpi/alsc.h"
 #include "controller/sharpen_algorithm.h"
 #include "controller/statistics.h"
 #include "controller/sync_algorithm.h"
@@ -90,6 +91,7 @@ const ControlInfoMap::Map ipaControls{
 			  ControlValue(controls::rpi::SyncModeClient) } },
 		      ControlValue(controls::rpi::SyncModeOff)) },
 	{ &controls::rpi::SyncFrames, ControlInfo(100, 100000, 1000) },
+	{ &controls::draft::LensShadingStrength, ControlInfo(-0.5f, 3.0f, 1.0f) },
 };
 
 /* IPA controls handled conditionally, if the sensor is not mono */
@@ -1601,6 +1603,21 @@ void IpaBase::applyControls(const ControlList &controls)
 				if (frames > 0)
 					sync->setReadyFrame(frames);
 			}
+			break;
+		}
+
+		case controls::draft::LENS_SHADING_STRENGTH: {
+			RPiController::Alsc *alsc = dynamic_cast<RPiController::Alsc *>(
+				controller_.getAlgorithm("alsc"));
+			if (!alsc) {
+				LOG(IPARPI, Warning)
+					<< "Could not set LENS_SHADING_STRENGTH - no ALSC algorithm";
+				break;
+			}
+
+			alsc->setStrength(ctrl.second.get<float>());
+			libcameraMetadata_.set(controls::draft::LensShadingStrength,
+					       ctrl.second.get<float>());
 			break;
 		}
 

@@ -232,6 +232,11 @@ void Alsc::initialise()
 		m.resize(XY);
 }
 
+void Alsc::setStrength(double strength)
+{
+	config_.luminanceStrength = std::clamp(strength, -0.5, 3.0);
+}
+
 void Alsc::waitForAysncThread()
 {
 	if (asyncStarted_) {
@@ -394,6 +399,12 @@ void Alsc::prepare(Metadata *imageMetadata)
 			       : config_.speed;
 	LOG(RPiAlsc, Debug)
 		<< "frame count " << frameCount_ << " speed " << speed;
+
+	if (speed == 1.0) {
+		firstTime_ = true;
+		switchMode(cameraMode_, imageMetadata);
+	}
+
 	{
 		std::unique_lock<std::mutex> lock(mutex_);
 		if (asyncStarted_ && asyncFinished_)
