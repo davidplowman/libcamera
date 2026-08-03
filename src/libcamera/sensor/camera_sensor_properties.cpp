@@ -261,6 +261,22 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
 			.testPatternModes = {},
 			.sensorDelays = { },
 		} },
+		{ "imx355", {
+			.unitCellSize = { 1120, 1120 },
+			.testPatternModes = {
+				{ controls::draft::TestPatternModeOff, 0 },
+				{ controls::draft::TestPatternModeColorBars, 1 },
+				{ controls::draft::TestPatternModeSolidColor, 2 },
+				{ controls::draft::TestPatternModeColorBarsFadeToGray, 3 },
+				{ controls::draft::TestPatternModePn9, 4 },
+			},
+			.sensorDelays = {
+				.exposureDelay = 2,
+				.gainDelay = 2,
+				.vblankDelay = 2,
+				.hblankDelay = 2
+			},
+		} },
 		{ "imx415", {
 			.unitCellSize = { 1450, 1450 },
 			.testPatternModes = {},
@@ -319,6 +335,26 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
 				.hblankDelay = 3
 			},
 		} },
+		{ "imx662", {
+			.unitCellSize = { 2900, 2900 },
+			.testPatternModes = {},
+			.sensorDelays = {
+				.exposureDelay = 2,
+				.gainDelay = 2,
+				.vblankDelay = 2,
+				.hblankDelay = 2
+			},
+		} },
+		{ "imx678", {
+			.unitCellSize = { 2000, 2000 },
+			.testPatternModes = {},
+			.sensorDelays = {
+				.exposureDelay = 2,
+				.gainDelay = 2,
+				.vblankDelay = 2,
+				.hblankDelay = 2
+			},
+		} },
 		{ "imx708", {
 			.unitCellSize = { 1400, 1400 },
 			.testPatternModes = {
@@ -333,6 +369,19 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
 				.gainDelay = 2,
 				.vblankDelay = 3,
 				.hblankDelay = 3
+			},
+		} },
+		{ "ov08d10", {
+			.unitCellSize = { 1120, 1120 },
+			.testPatternModes =  {
+				{ controls::draft::TestPatternModeOff, 0 },
+				{ controls::draft::TestPatternModeCustom1, 1 },
+			},
+			.sensorDelays = {
+				.exposureDelay = 2,
+				.gainDelay = 2,
+				.vblankDelay = 2,
+				.hblankDelay = 2
 			},
 		} },
 		{ "ov2685", {
