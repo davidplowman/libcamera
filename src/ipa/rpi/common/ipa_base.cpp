@@ -115,9 +115,16 @@ const ControlInfoMap::Map ipaAfControls{
 	{ &controls::LensPosition, ControlInfo(0.0f, 32.0f, 1.0f) }
 };
 
+/* IPA controls specific to the PiSP platform */
+const ControlInfoMap::Map pispControls{
+	{ &controls::rpi::ScalerCrops, ControlInfo(Rectangle{}, Rectangle(65535, 65535, 65535, 65535), Rectangle{}) },
+	{ &controls::rpi::LensShadingTable, ControlInfo(0.0f, 8.0f) },
+	{ &controls::rpi::GammaCurve, ControlInfo(0.0f, 65535.0f) },
+};
+
 /* Platform specific controls */
 const std::map<const std::string, ControlInfoMap::Map> platformControls{
-	{ "pisp", { { &controls::rpi::ScalerCrops, ControlInfo(Rectangle{}, Rectangle(65535, 65535, 65535, 65535), Rectangle{}) }, { &controls::rpi::LensShadingTable, ControlInfo(0.0f, 8.0f) } } },
+	{ "pisp", pispControls },
 };
 
 } /* namespace */
