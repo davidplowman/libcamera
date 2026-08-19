@@ -403,8 +403,19 @@ void IpaPiSP::platformPrepareIsp([[maybe_unused]] const PrepareParams &params,
 
 	ContrastStatus *contrastStatus =
 		rpiMetadata.getLocked<ContrastStatus>("contrast.status");
-	if (contrastStatus)
+	if (contrastStatus) {
 		applyContrast(contrastStatus, global);
+
+		/* Report the gamma curve that was applied, as flat (x, y) co-ordinate pairs. */
+		std::vector<float> gammaCurve;
+		gammaCurve.reserve(2 * contrastStatus->gammaCurve.size());
+		contrastStatus->gammaCurve.map([&gammaCurve](double x, double y) {
+			gammaCurve.push_back(x);
+			gammaCurve.push_back(y);
+		});
+		libcameraMetadata_.set(controls::rpi::GammaCurve,
+				       Span<const float>(gammaCurve.data(), gammaCurve.size()));
+	}
 
 	CcmStatus *ccmStatus = rpiMetadata.getLocked<CcmStatus>("ccm.status");
 	if (ccmStatus)

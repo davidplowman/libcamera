@@ -324,4 +324,22 @@ controls:
         directly to an image.
 
         This control is only supported on the PiSP (Pi 5 or later) platform.
+
+  - GammaCurve:
+      type: float
+      size: [n]
+      direction: out
+      description: |
+        The piecewise linear gamma (contrast) curve that was applied to the
+        current frame, expressed as a flat array of alternating (x, y)
+        co-ordinate pairs, listed in order of increasing x.
+
+        Both x and y values are in the same units as the raw (de-mosaicked)
+        pixel values that the curve is applied to, typically the range
+        [0, 65535] for 16-bit signals. The curve should be linearly
+        interpolated between the given points; values of x below the first
+        point or above the last point should be clamped to the first or last
+        y value respectively.
+
+        This control is only supported on the PiSP (Pi 5 or later) platform.
 ...
