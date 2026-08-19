@@ -116,10 +116,8 @@ const ControlInfoMap::Map ipaAfControls{
 };
 
 /* Platform specific controls */
-const std::map<const std::string, ControlInfoMap::Map> platformControls {
-	{ "pisp", {
-		{ &controls::rpi::ScalerCrops, ControlInfo(Rectangle{}, Rectangle(65535, 65535, 65535, 65535), Rectangle{}) }
-	} },
+const std::map<const std::string, ControlInfoMap::Map> platformControls{
+	{ "pisp", { { &controls::rpi::ScalerCrops, ControlInfo(Rectangle{}, Rectangle(65535, 65535, 65535, 65535), Rectangle{}) }, { &controls::rpi::LensShadingTable, ControlInfo(0.0f, 8.0f) } } },
 };
 
 } /* namespace */

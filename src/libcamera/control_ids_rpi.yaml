@@ -308,4 +308,20 @@ controls:
         This control returns performance metrics for the CNN processing stage.
         Two values are returned in this span, the runtime of the CNN/DNN stage
         and the DSP stage in milliseconds.
+
+  - LensShadingTable:
+      type: float
+      size: [3,32,32]
+      direction: out
+      description: |
+        The lens shading correction tables that were applied to the current
+        the current frame, expressed as 3 colour channels (R, G, B), each a
+        32x32 grid of gains covering the full raw image from the sensor.
+
+        These values are linear gains, so 1.0 indicates that no change was
+        made at that location. Tables need to be upscaled to the full image
+        resolution, preserving the corner points, before they can be applied
+        directly to an image.
+
+        This control is only supported on the PiSP (Pi 5 or later) platform.
 ...
