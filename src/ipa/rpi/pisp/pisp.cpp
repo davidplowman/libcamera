@@ -411,8 +411,17 @@ void IpaPiSP::platformPrepareIsp([[maybe_unused]] const PrepareParams &params,
 		applyCCM(ccmStatus, global);
 
 	AlscStatus *alscStatus = rpiMetadata.getLocked<AlscStatus>("alsc.status");
-	if (alscStatus)
+	if (alscStatus) {
 		applyLensShading(alscStatus, global);
+
+		/* Report the lens shading table that was applied, as 3 planes of R, G, B gains. */
+		constexpr unsigned int LscCells = NumLscCells * NumLscCells;
+		float lensShadingTable[3 * LscCells];
+		std::copy(alscStatus->r.begin(), alscStatus->r.end(), lensShadingTable);
+		std::copy(alscStatus->g.begin(), alscStatus->g.end(), lensShadingTable + LscCells);
+		std::copy(alscStatus->b.begin(), alscStatus->b.end(), lensShadingTable + 2 * LscCells);
+		libcameraMetadata_.set(controls::rpi::LensShadingTable, lensShadingTable);
+	}
 
 	DpcStatus *dpcStatus = rpiMetadata.getLocked<DpcStatus>("dpc.status");
 	if (dpcStatus)
