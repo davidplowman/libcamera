@@ -644,6 +644,11 @@ int PipelineHandlerBase::exportFrameBuffers([[maybe_unused]] Camera *camera, lib
 
 	s->setExportedBuffers(buffers);
 
+	/* Map the input Bayer buffers as well for AI denoise. */
+	CameraData *data = cameraData(camera);
+	if (data->frontendDevice() == s->dev())
+		mapBuffers(camera, s->getBuffers(), RPi::MaskBayerData);
+
 	return ret;
 }
 
@@ -768,6 +773,10 @@ int PipelineHandlerBase::queueRequestDevice(Camera *camera, Request *request)
 			 * so we can track it.
 			 */
 			stream->setExportedBuffer(buffer);
+
+			/* Map the input Bayer buffers as well for AI denoise. */
+			if (data->frontendDevice() == stream->dev())
+				mapBuffers(camera, stream->getBuffers(), RPi::MaskBayerData);
 		}
 
 		/*

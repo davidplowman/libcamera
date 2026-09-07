@@ -413,6 +413,8 @@ void IpaBase::mapBuffers(const std::vector<IPABuffer> &buffers)
 		const FrameBuffer fb(buffer.planes);
 		buffers_.emplace(buffer.id,
 				 MappedFrameBuffer(&fb, MappedFrameBuffer::MapFlag::ReadWrite));
+
+		buffersFds_.emplace(buffer.id, buffer.planes[0].fd);
 	}
 }
 
@@ -424,6 +426,12 @@ void IpaBase::unmapBuffers(const std::vector<unsigned int> &ids)
 			continue;
 
 		buffers_.erase(id);
+
+		auto itf = buffersFds_.find(id);
+		if (itf == buffersFds_.end())
+			continue;
+
+		buffersFds_.erase(id);
 	}
 }
 
@@ -489,6 +497,15 @@ void IpaBase::prepareIsp(const PrepareParams &params)
 
 	bool delayedRequestControls = false;
 	delayedMetadata.get<bool>("ipa.request_controls", delayedRequestControls);
+
+	/* Pass in the image buffer span. */
+	{
+		auto bayer_it = buffers_.find(params.buffers.bayer);
+		auto bayer_fd_it = buffersFds_.find(params.buffers.bayer);
+		ASSERT(bayer_it != buffers_.end());
+		rpiMetadata.set("global.bayer_buffer",
+				std::pair<SharedFD, Span<uint8_t>> {bayer_fd_it->second, bayer_it->second.planes()[0]});
+	}
 
 	/* Allow a 10% margin on the comparison below. */
 	Duration delta = (frameTimestamp - lastRunTimestamp_) * 1.0ns;
