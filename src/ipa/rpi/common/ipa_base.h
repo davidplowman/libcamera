@@ -106,6 +106,7 @@ private:
 		      utils::Duration frameDurationOffset = utils::Duration(0));
 
 	std::map<unsigned int, MappedFrameBuffer> buffers_;
+	std::map<unsigned int, SharedFD> buffersFds_;
 
 	bool lensPresent_;
 	bool monoSensor_;

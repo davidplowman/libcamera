@@ -54,7 +54,7 @@
                 {
                     "sdn":
                     {
-                        "deviation": 0.6,
+                        "deviation": 1.0,
                         "strength": 0.95,
                         "deviation2": 3.2,
                         "deviation_no_tdn": 3.2,
@@ -67,7 +67,7 @@
                     },
                     "tdn":
                     {
-                        "deviation": 1.0,
+                        "deviation": 1.5,
                         "threshold": 0.05
                     }
                 },
