@@ -89,7 +89,18 @@
             }
         },
         {
-            "rpi.model_denoise": {
+            "rpi.denoise_ncnn": {
+                "param": "/home/pi/ncnn_models/imx662_32_2e11_968x548_fp16.param",
+                "bin": "/home/pi/ncnn_models/imx662_32_2e11_968x548_fp16.bin",
+		"threads": 2,
+		"downscale": true,
+		"sdn_disable": true,
+		"tdn_disable": false,
+		"cdn_disable": false
+            }
+        },
+        {
+            "x.rpi.model_denoise": {
                 "param": "/home/pi/libcamera/src/ipa/rpi/pisp/data/imx662_ncnn.param",
                 "bin": "/home/pi/libcamera/src/ipa/rpi/pisp/data/imx662_ncnn.bin",
                 "bstm": false,
