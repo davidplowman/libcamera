@@ -265,9 +265,78 @@ void ModelDenoise::initialise()
 	std::string param = param_;
 	bstm_active_ = false;
 	bstm_full_active_ = false;
+#ifdef RPI_HAVE_BSTM
+	/*
+	 * Whole-model path first: if it loads there is no ncnn graph to build at
+	 * all. Deliberately silent-and-fall-back rather than fatal -- a wrong
+	 * tile size or a missing .bstm should degrade to the CPU pipeline, not
+	 * take the camera down.
+	 */
+	if (bstm_full_enable_ && !bstm_full_model_.empty()) {
+		const bool ok = bstm_s2d_block_
+					? bstm_full_.loadS2D(bstm_full_model_, feedCh(),
+							     infer_w_, infer_h_,
+							     bstm_s2d_block_, 4u)
+					: bstm_full_.load(bstm_full_model_, feedCh(),
+							  infer_w_, infer_h_, 4u);
+		if (ok) {
+			bstm_full_active_ = true;
+			bstm_full_.setThreads(std::max(threads_, 1));
+			LOG(RPiModelDenoise, Info)
+				<< "BSTM FULL model active: " << bstm_full_model_
+				<< " tile=" << infer_w_ << "x" << infer_h_
+				<< " in_ch=" << feedCh()
+				<< (bstm_s2d_block_
+					    ? " s2d block=" + std::to_string(bstm_s2d_block_)
+					      + " grid=" + std::to_string(infer_w_ / bstm_s2d_block_)
+					      + "x" + std::to_string(infer_h_ / bstm_s2d_block_)
+					      + " uncovered_rows="
+					      + std::to_string(bstm_full_.uncoveredRows())
+					    : std::string());
+		} else {
+			LOG(RPiModelDenoise, Warning)
+				<< "BSTM full model failed to load (tile must match the"
+				<< " compiled " << infer_w_ << "x" << infer_h_ << "x"
+				<< feedCh() << "); falling back";
+		}
+	}
+	if (!bstm_full_active_ && bstm_enable_ && !bstm_param_.empty() &&
+	    !bstm_model_.empty()) {
+		bstm_cfg_.model_path = bstm_model_;
+		net_.register_custom_layer("BstmTrunk", BstmTrunk_layer_creator,
+					   BstmTrunk_layer_destroyer, &bstm_cfg_);
+		if (net_.load_param(bstm_param_.c_str()) == 0 &&
+		    net_.load_model(bin_.c_str()) == 0) {
+			bstm_active_ = true;
+			LOG(RPiModelDenoise, Info)
+				<< "BSTM trunk active: " << bstm_param_
+				<< " model=" << bstm_model_;
+		} else {
+			LOG(RPiModelDenoise, Warning)
+				<< "BSTM offload unavailable (is bstorm-daemon running?),"
+				<< " falling back to CPU ncnn: " << param_;
+			net_.clear();
+			net_.opt.blob_allocator = &blobPool_;
+			net_.opt.workspace_allocator = &workPool_;
+			net_.opt.use_vulkan_compute = false;
+			net_.opt.use_fp16_arithmetic = fp16_;
+			net_.opt.use_fp16_packed = fp16_;
+			net_.opt.use_fp16_storage = fp16_;
+			net_.register_custom_layer("BilateralAssemble", BilateralAssemble_layer_creator);
+			net_.register_custom_layer("GuideBlur5", GuideBlur5_layer_creator);
+			net_.register_custom_layer("KpnAssembleLR", KpnAssembleLR_layer_creator);
+			net_.register_custom_layer("LfLocks", LfLocks_layer_creator);
+			net_.register_custom_layer("BoxBlurR", BoxBlurR_layer_creator);
+			net_.register_custom_layer("InputShrink", InputShrink_layer_creator);
+			net_.register_custom_layer("BilateralAssembleLR",
+						   BilateralAssembleLR_layer_creator);
+		}
+	}
+#else
 	if (bstm_enable_)
 		LOG(RPiModelDenoise, Warning)
 			<< "bstm requested but libcamera was built without BSTM support";
+#endif
 
 	if (!bstm_full_active_ && !bstm_active_ &&
 	    (net_.load_param(param.c_str()) != 0 || net_.load_model(bin_.c_str()) != 0)) {
@@ -1205,6 +1274,19 @@ bool ModelDenoise::runNet(ncnn::Mat &out)
 	 * elemsize-2 external buffer as fp32 and walks off the end (measured:
 	 * malloc(): corrupted top size), so that path materialises fp32.
 	 */
+#ifdef RPI_HAVE_BSTM
+	if (bstm_full_active_) {
+		/* No ncnn at all: feed_chw_ straight to the NPU program. run() is
+		 * templated on FeedT, so this covers the fp16 and fp32 feeds. */
+		const bool ok = bstm_s2d_block_
+					? (bstm_feed_merged_ ? bstm_full_.execUnfold(out)
+						  : bstm_full_.runS2D(feed_chw_.data(), out))
+					: bstm_full_.run(feed_chw_.data(), out);
+		LOG(RPiModelDenoise, Info) << "ok = " << ok;
+		return ok && out.c >= 4 && (unsigned)out.w == infer_w_ &&
+		       (unsigned)out.h == infer_h_;
+	}
+#endif
 
 	ncnn::Mat in;
 	if (fp16_) {
@@ -1299,7 +1381,14 @@ void ModelDenoise::prepare([[maybe_unused]] Metadata *imageMetadata)
 
 	if (!init_ || !bayer.second.data() || !pack_step_ || !width_ || !height_ ||
 	    tiles_.empty()) {
-		LOG(RPiModelDenoise, Info) << "ModelDenoise::prepare not running";
+		LOG(RPiModelDenoise, Info)
+			<< "ModelDenoise::prepare not running:"
+			<< (!init_ ? " init_=false" : "")
+			<< (!bayer.second.data() ? " no_bayer_buffer" : "")
+			<< (!pack_step_ ? " pack_step_=0" : "")
+			<< (!width_ ? " width_=0" : "")
+			<< (!height_ ? " height_=0" : "")
+			<< (tiles_.empty() ? " tiles_empty" : "");
 		return;
 	}
 
@@ -1632,6 +1721,25 @@ void ModelDenoise::prepare([[maybe_unused]] Metadata *imageMetadata)
 		 * nsa-pipeline-is-bandwidth-bound.
 		 */
 		bstm_feed_merged_ = false;
+#ifdef RPI_HAVE_BSTM
+		/*
+		 * Split-input model: fold writes the image slot and the block means
+		 * directly, so the NPU never receives the memory slots or the gain
+		 * plane it only ever averages. buildFeed still runs -- it applies the
+		 * temporal blend and the brightness normalisation that the fold reads.
+		 */
+		if (bstm_full_active_ && bstm_s2d_block_ && bstm_full_.inputCount() == 2) {
+			auto tb0 = std::chrono::steady_clock::now();
+			buildFeed(t, gain);
+			auto tb1 = std::chrono::steady_clock::now();
+			bstm_feed_merged_ = bstm_full_.foldSplit(feed_chw_.data(),
+								 bstm_full_.inputPayload(0),
+								 bstm_full_.inputPayload(1));
+			auto tb2 = std::chrono::steady_clock::now();
+			ms_build_ = std::chrono::duration<double, std::milli>(tb1 - tb0).count();
+			ms_fold_ = std::chrono::duration<double, std::milli>(tb2 - tb1).count();
+		}
+#endif
 		if (!bstm_feed_merged_)
 			buildFeed(t, gain);
 		auto tf1 = std::chrono::steady_clock::now();
@@ -1833,7 +1941,9 @@ void ModelDenoise::prepare([[maybe_unused]] Metadata *imageMetadata)
 			<< " mdiff=" << accum_.lastMeanDiff()
 			<< " sig=" << accum_.lastMeanSigma()
 			<< " meanN=" << accum_.lastMeanN()
-			/*<< " exec=" << bstm_full_.lastExecMs() << " unfold=" << bstm_full_.lastUnfoldMs()*/
+#ifdef RPI_HAVE_BSTM
+			<< " exec=" << bstm_full_.lastExecMs() << " unfold=" << bstm_full_.lastUnfoldMs()
+#endif
 			<< " build=" << ms_build_ << " fold=" << ms_fold_
 			<< " warp=" << (accum_.lastDx() || accum_.lastDy() ? 1 : 0)
 			<< " tiles=" << tiles_.size() << " again=" << gain << " dgain=" << dgain

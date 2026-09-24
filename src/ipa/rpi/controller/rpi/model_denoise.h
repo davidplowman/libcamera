@@ -27,6 +27,10 @@
 
 #include <ncnn/net.h>
 
+#ifdef RPI_HAVE_BSTM
+#include "bstm_full.h"
+#include "bstm_trunk.h"
+#endif
 
 #include "agc_status.h"
 #include "black_level_status.h"
@@ -271,6 +275,10 @@ private:
 	/* Set per tile by the caller; runNet() needs to know whether the
 	 * payload was already filled by the merged path. */
 	bool bstm_feed_merged_ = false;
+#ifdef RPI_HAVE_BSTM
+	BstmTrunkConfig bstm_cfg_;
+	BstmFullModel bstm_full_;
+#endif
 	/* Per-pixel master-dark (DSNU) subtraction. */
 	bool calib_enabled_;
 	std::string calib_dir_;

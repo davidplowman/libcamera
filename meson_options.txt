@@ -108,6 +108,11 @@ option('rpi-awb-nn',
         value : 'auto',
         description : 'Enable the Raspberry Pi Neural Network AWB algorithm')
 
+option('bstm_root',
+        type : 'string',
+        value : '',
+        description : 'Path to the BSTM (BrainStorm) NPU SDK tree, enabling NPU offload of the rpi.model_denoise predictor trunk')
+
 option('softisp-gpu',
         type : 'feature',
         value : 'auto',
