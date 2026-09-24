@@ -89,22 +89,22 @@
             }
         },
         {
-            "rpi.denoise_ncnn": {
-                "param": "/home/pi/ncnn_models/imx662_32_2e11_968x548_fp16.param",
-                "bin": "/home/pi/ncnn_models/imx662_32_2e11_968x548_fp16.bin",
+            "x.rpi.denoise_ncnn": {
+                "param": "/home/hailo/libcamera/src/ipa/rpi/pisp/data/ncnn/imx662_32_2e11_1936x1096_fp16.param",
+                "bin": "/home/hailo/libcamera/src/ipa/rpi/pisp/data/ncnn/imx662_32_2e11_1936x1096_fp16.bin",
 		"threads": 2,
-		"downscale": true,
+		"downscale": false,
 		"sdn_disable": true,
 		"tdn_disable": false,
 		"cdn_disable": false
             }
         },
         {
-            "x.rpi.model_denoise": {
-                "param": "/home/pi/libcamera/src/ipa/rpi/pisp/data/imx662_ncnn.param",
-                "bin": "/home/pi/libcamera/src/ipa/rpi/pisp/data/imx662_ncnn.bin",
-                "bstm": false,
-                "bstm_full": false,
+            "rpi.model_denoise": {
+                "param": "/home/hailo/libcamera/src/ipa/rpi/pisp/data/imx662_ncnn.param",
+                "bin": "/home/hailo/libcamera/src/ipa/rpi/pisp/data/imx662_ncnn.bin",
+                "bstm": true,
+                "bstm_full": true,
 		"calib": false,
                 "bstm_param": "/usr/local/share/libcamera/ipa/rpi/pisp/m9_datafix_bstm.param",
                 "bstm_model": "/usr/local/share/libcamera/ipa/rpi/pisp/m9_trunk.bstm",
