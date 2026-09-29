@@ -108,10 +108,10 @@ option('rpi-awb-nn',
         value : 'auto',
         description : 'Enable the Raspberry Pi Neural Network AWB algorithm')
 
-option('bstm_root',
+option('rpi-teflon-dir',
         type : 'string',
         value : '',
-        description : 'Path to the BSTM (BrainStorm) NPU SDK tree, enabling NPU offload of the rpi.model_denoise predictor trunk')
+        description : 'Directory containing Mesa\'s libteflon.so and libbstm_compiler.so, enabling the Raspberry Pi BSTM NPU denoise algorithm (default: search the usual library directories)')
 
 option('softisp-gpu',
         type : 'feature',

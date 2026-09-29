@@ -4,7 +4,8 @@
  *
  * Simple NCNN-based full-frame denoise. No temporal accumulation, no
  * tiling, no brightness normalisation -- just: pack Bayer -> 4 planes,
- * run the network, unpack back over the same buffer.
+ * space-to-depth -> 16 planes, run the network, unpack back over the same
+ * buffer.
  */
 #pragma once
 
@@ -31,10 +32,12 @@ public:
 private:
 	void packBayer(const uint16_t *bayer16, unsigned stridePx);
 	void packBayerDownscale(const uint16_t *bayer16, unsigned stridePx);
+	void zeroBorder();
 	void unpackBayer(uint16_t *bayer16, unsigned stridePx, const ncnn::Mat &out);
+	void depthToRaw(uint16_t *bayer16, unsigned stridePx, const ncnn::Mat &out);
+	void depthToSpace(const ncnn::Mat &out);
 	void interleaveToRaw(uint16_t *bayer16, unsigned stridePx, const float *R, const float *G1,
 			     const float *G2, const float *B, unsigned srcStride);
-	void upscale2x(const ncnn::Mat &out);
 	void upscaleChannel2x(const float *src, unsigned srcStride, unsigned srcW, unsigned srcH,
 			       float *dst, unsigned dstStride, unsigned dstH);
 	bool runNet(ncnn::Mat &out);
@@ -54,12 +57,13 @@ private:
 
 	/*
 	 * When set, box-average each Bayer colour component over an
-	 * additional 2x2 (so each network-plane pixel covers a 4x4 raw
-	 * block instead of 2x2), run the network at that quarter resolution,
-	 * then bilinearly upscale its output back to half resolution before
-	 * the usual raw-Bayer interleave. Halves netW_/netH_ in each
-	 * dimension relative to a non-downscale network trained for the same
-	 * sensor mode. Requires a network trained on quarter-res input.
+	 * additional 2x2 before the space-to-depth (so each network-plane
+	 * pixel covers an 8x8 raw block instead of 4x4), run the network at
+	 * that resolution, then depth-to-space and bilinearly upscale its
+	 * output back to half resolution before the usual raw-Bayer
+	 * interleave. Halves netW_/netH_ in each dimension relative to a
+	 * non-downscale network trained for the same sensor mode. Requires a
+	 * network trained on quarter-res input.
 	 */
 	bool downscale_ = false;
 
@@ -67,12 +71,18 @@ private:
 	 * cheap glue layers, little real per-layer compute) can end up
 	 * *slower* with more threads -- the fixed per-region coordination
 	 * cost outweighs the parallel work available -- so this is a tuning
-	 * parameter, not a fixed constant. */
+	 * parameter, not a fixed constant. Also used by the downscale_
+	 * packing/unpacking loops; the full-res pack/unpack are memory-bound
+	 * and always single-threaded. */
 	int threads_ = 2;
 
-	ncnn::Net net_;
+	/*
+	 * The pools must be declared before (so destroyed after) net_, which
+	 * still holds memory from them until it is itself destroyed.
+	 */
 	ncnn::PoolAllocator blobPool_;
 	ncnn::PoolAllocator workPool_;
+	ncnn::Net net_;
 
 	bool init_ = false;
 	unsigned width_ = 0; /* cameraMode.width, the raw Bayer width */
@@ -80,23 +90,35 @@ private:
 
 	/*
 	 * Per-plane buffer geometry, set in switchMode(). netW_/netH_ are
-	 * packW_/packH_ each rounded up to a multiple of alignW_/alignH_.
-	 * validW_/validH_ (= width_/2, height_/2, regardless of downscale_)
-	 * are the half-res Bayer-grid region that the final raw-Bayer
-	 * interleave step reads/writes; packW_/packH_ are the net-plane-pixel
-	 * region actually backed by real data -- equal to validW_/validH_
-	 * when !downscale_, or half that (one net pixel per 4x4 raw block
-	 * instead of 2x2) when downscale_. Anything beyond packW_/packH_ up
-	 * to netW_/netH_ is zero-filled context. A smaller sensor mode than
-	 * the network's own training resolution is fine; it just means a
-	 * smaller (or more heavily padded) buffer.
+	 * the network's plane size (fixedPlaneW_/fixedPlaneH_, or failing
+	 * that packW_/packH_ rounded up to a multiple of alignW_/alignH_).
+	 * packW_/packH_ are the net-plane-pixel region actually backed by
+	 * real data: one net pixel per 4x4 raw block, or per 8x8 raw block
+	 * when downscale_. bayerW_/bayerH_ (= packW_*2, packH_*2) are the
+	 * size of the 4 Bayer planes before space-to-depth -- half-res, or
+	 * quarter-res when downscale_. validW_/validH_ (half-res) are the
+	 * Bayer-grid region that the final write back to raw covers -- equal
+	 * to bayerW_/bayerH_ when !downscale_, or twice that when downscale_.
+	 * Anything beyond packW_/packH_ up to netW_/netH_ is zero-filled
+	 * context. A smaller sensor mode than the network's own training
+	 * resolution is fine; it just means a smaller (or more heavily
+	 * padded) buffer.
 	 */
 	unsigned netW_ = 0;
 	unsigned netH_ = 0;
-	unsigned validW_ = 0;
-	unsigned validH_ = 0;
 	unsigned packW_ = 0;
 	unsigned packH_ = 0;
+	unsigned bayerW_ = 0;
+	unsigned bayerH_ = 0;
+	unsigned validW_ = 0;
+	unsigned validH_ = 0;
+
+	/*
+	 * Distance between channel planes in buffer_, in fp16 samples:
+	 * netW_ * netH_ rounded up to a 16-byte boundary, matching the cstep
+	 * ncnn::Mat uses when wrapping external data.
+	 */
+	size_t planeStride_ = 0;
 
 	/*
 	 * Required net-plane-pixel alignment, computed once in initialise()
@@ -122,7 +144,7 @@ private:
 	/*
 	 * Exact required per-plane size (not just "a multiple of"), read
 	 * directly from the largest fixed target height/width among the
-	 * .param file's Interp layers (doubled -- see computeAlignment()).
+	 * .param file's Interp layers (see computeAlignment()).
 	 * ncnn's Interp layer, unless using dynamic_target_size, bakes in an
 	 * absolute pixel target rather than a scale factor, so this is a
 	 * direct, reliable read of what the network's decoder actually
@@ -133,14 +155,32 @@ private:
 	unsigned fixedPlaneW_ = 0;
 	unsigned fixedPlaneH_ = 0;
 
-	/* 4 planes (R, G1, G2, B), each netW_ x netH_, planar fp16. */
+	/*
+	 * The network's input channel count, read from its first
+	 * Convolution layer by computeAlignment() (0 if it couldn't be).
+	 * Must be 16.
+	 */
+	unsigned inChannels_ = 0;
+
+	/*
+	 * 16 planes, each netW_ x netH_ (planeStride_ apart), planar fp16:
+	 * the 4 Bayer planes (R, G1, G2, B) after space_to_depth(2), channel
+	 * c*4 + i*2 + j being Bayer plane c's (row i, column j) sub-position.
+	 */
 	std::vector<__fp16> buffer_;
 
 	/*
+	 * downscale_ only: 4 planes (R, G1, G2, B), each bayerW_ x bayerH_,
+	 * planar fp32 -- the network's output after depth_to_space(2), i.e.
+	 * still quarter-res. Empty when !downscale_.
+	 */
+	std::vector<float> bayerBuffer_;
+
+	/*
 	 * downscale_ only: 4 planes (R, G1, G2, B), each validW_ x validH_,
-	 * planar fp32 -- the network's quarter-res output, bilinearly
-	 * upscaled 2x in each dimension back to half-res, ready for
-	 * interleaveToRaw(). Empty when !downscale_.
+	 * planar fp32 -- bayerBuffer_ bilinearly upscaled 2x in each
+	 * dimension back to half-res, ready for interleaveToRaw(). Empty
+	 * when !downscale_.
 	 */
 	std::vector<float> upscaleBuffer_;
 };

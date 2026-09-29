@@ -67,28 +67,29 @@ inline void packStore8(__fp16 *dst, uint16x8_t v, float32x4_t inv)
 }
 
 /*
- * downscale_ pack: top/bot each hold 8 raw uint16 samples of one Bayer
- * colour, one per half-res cell, from two raw rows 2 apart (top: the
- * block's first cell-row, bot: its second). Sums the two rows (the
- * block's vertical pair), then vpaddq_f32 sums each adjacent pair of
- * lanes (the block's horizontal pair) -- together giving, per output
- * lane, the sum of exactly the 4 same-colour raw samples in one 4x4
- * block. 4 fp16 outputs from 8+8 raw-derived inputs, each divided by
- * (65535*4) via invQuarter. vpaddq_f32 is an ARMv8/aarch64 NEON
- * instruction (not available under plain 32-bit ARMv7 NEON); this file
- * already assumes aarch64 in practice (Pi 5 is the only real target),
- * via __fp16 and the __ARM_FP16_FORMAT_IEEE guard this sits under.
+ * downscale_ pack: a, b, c, d each hold 8 raw uint16 samples of one Bayer
+ * colour, one per consecutive 4x4 raw block along a row (a/b: the two
+ * same-colour columns of the block's first same-colour row, c/d: of its
+ * second). Summing all four gives, per lane, the sum of exactly the 4
+ * same-colour samples in one 4x4 block (i.e. the 2x2 Bayer-plane average,
+ * once scaled by invQuarter = 1/(65535*4)). The 8 consecutive blocks are
+ * then split into even ones (dstEven, space-to-depth column j=0) and odd
+ * ones (dstOdd, j=1), 4 fp16 outputs each. vuzp1q_f32/vuzp2q_f32 are
+ * aarch64-only; this file already assumes aarch64 in practice (Pi 5 is the
+ * only real target), via __fp16 and the __ARM_FP16_FORMAT_IEEE guard this
+ * sits under.
  */
-inline void packStore4Sum4(__fp16 *dst, uint16x8_t top, uint16x8_t bot, float32x4_t invQuarter)
+inline void packStore4x2Sum4(__fp16 *dstEven, __fp16 *dstOdd, uint16x8_t a, uint16x8_t b,
+			     uint16x8_t c, uint16x8_t d, float32x4_t invQuarter)
 {
-	float32x4_t topLo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(top)));
-	float32x4_t topHi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(top)));
-	float32x4_t botLo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(bot)));
-	float32x4_t botHi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(bot)));
-	float32x4_t sumLo = vaddq_f32(topLo, botLo);
-	float32x4_t sumHi = vaddq_f32(topHi, botHi);
-	float32x4_t sum4 = vpaddq_f32(sumLo, sumHi);
-	vst1_f16(dst, vcvt_f16_f32(vmulq_f32(sum4, invQuarter)));
+	uint32x4_t lo = vaddq_u32(vaddl_u16(vget_low_u16(a), vget_low_u16(b)),
+				  vaddl_u16(vget_low_u16(c), vget_low_u16(d)));
+	uint32x4_t hi = vaddq_u32(vaddl_u16(vget_high_u16(a), vget_high_u16(b)),
+				  vaddl_u16(vget_high_u16(c), vget_high_u16(d)));
+	float32x4_t loF = vmulq_f32(vcvtq_f32_u32(lo), invQuarter);
+	float32x4_t hiF = vmulq_f32(vcvtq_f32_u32(hi), invQuarter);
+	vst1_f16(dstEven, vcvt_f16_f32(vuzp1q_f32(loF, hiF)));
+	vst1_f16(dstOdd, vcvt_f16_f32(vuzp2q_f32(loF, hiF)));
 }
 #endif
 
@@ -113,6 +114,22 @@ inline uint16_t quantise(float v)
 	v = v < 0.0f ? 0.0f : (v > 65535.0f ? 65535.0f : v);
 	return uint16_t(std::lround(v));
 }
+
+/*
+ * The network's input/output is the 4 Bayer planes (R, G1, G2, B, i.e.
+ * raw 2x2-cell positions (0,0), (1,0), (0,1), (1,1)) further packed by
+ * space_to_depth(2) (PyTorch pixel_unshuffle): channel c*4 + i*2 + j holds
+ * Bayer plane c's (row i, column j) sub-position within each 2x2 block of
+ * that plane. Without downscale_, that means one network pixel per 4x4
+ * raw block, and this returns the channel holding raw offset (dx, dy)
+ * within that block.
+ */
+constexpr unsigned rawToChannel(unsigned dx, unsigned dy)
+{
+	return 4 * (2 * (dy & 1) + (dx & 1)) + 2 * (dy >> 1) + (dx >> 1);
+}
+
+constexpr unsigned kChannels = 16;
 
 } /* namespace */
 
@@ -162,6 +179,13 @@ void DenoiseNcnn::initialise()
 
 	computeAlignment();
 
+	if (inChannels_ && inChannels_ != kChannels) {
+		LOG(RPiDenoiseNcnn, Error)
+			<< param_ << " takes " << inChannels_ << " input channels, but "
+			<< kChannels << " (space-to-depth packed Bayer) are required";
+		return;
+	}
+
 	init_ = true;
 }
 
@@ -171,10 +195,12 @@ void DenoiseNcnn::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 	height_ = cameraMode.height;
 
 	/*
-	 * Buffer geometry. packW_/packH_ is the net-plane-pixel region
-	 * actually backed by real Bayer data: one pixel per 2x2 raw cell
-	 * normally, or one pixel per 4x4 raw block (validW_/validH_ halved
-	 * again) when downscale_.
+	 * Buffer geometry. The 4 Bayer planes the network sees are half the
+	 * raw size normally, or a quarter when downscale_ (2x2 averaged).
+	 * space_to_depth(2) halves those again, so packW_/packH_, the
+	 * net-plane-pixel region actually backed by real Bayer data, is one
+	 * pixel per 4x4 raw block normally, or per 8x8 raw block when
+	 * downscale_.
 	 *
 	 * netW_/netH_ (the padded size actually fed to the network) prefers
 	 * fixedPlaneW_/fixedPlaneH_, the network's own exact required plane
@@ -190,10 +216,9 @@ void DenoiseNcnn::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 	 * just means more zero-filled border relative to the valid
 	 * (packW_ x packH_) region; larger isn't (see the clamp below).
 	 */
-	validW_ = width_ / 2;
-	validH_ = height_ / 2;
-	unsigned packW = downscale_ ? validW_ / 2 : validW_;
-	unsigned packH = downscale_ ? validH_ / 2 : validH_;
+	const unsigned bayerDiv = downscale_ ? 4 : 2;
+	unsigned packW = width_ / bayerDiv / 2;
+	unsigned packH = height_ / bayerDiv / 2;
 
 	if (fixedPlaneW_ && fixedPlaneH_) {
 		netW_ = fixedPlaneW_;
@@ -216,18 +241,31 @@ void DenoiseNcnn::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 	}
 	packW_ = packW;
 	packH_ = packH;
-	validW_ = downscale_ ? packW_ * 2 : packW_;
-	validH_ = downscale_ ? packH_ * 2 : packH_;
+	bayerW_ = packW_ * 2;
+	bayerH_ = packH_ * 2;
+	validW_ = downscale_ ? bayerW_ * 2 : bayerW_;
+	validH_ = downscale_ ? bayerH_ * 2 : bayerH_;
 
-	buffer_.assign(size_t(4) * netW_ * netH_, __fp16(0.0f));
-	if (downscale_)
+	/*
+	 * Must match the cstep ncnn::Mat computes when wrapping buffer_ in
+	 * runNet(): each channel starts on a 16-byte boundary, so a plane
+	 * whose size isn't a multiple of 8 fp16 samples (e.g. 242x138) is
+	 * followed by padding.
+	 */
+	planeStride_ = (size_t(netW_) * netH_ * sizeof(__fp16) + 15) / 16 * 16 / sizeof(__fp16);
+
+	buffer_.assign(kChannels * planeStride_, __fp16(0.0f));
+	if (downscale_) {
+		bayerBuffer_.assign(size_t(4) * bayerW_ * bayerH_, 0.0f);
 		upscaleBuffer_.assign(size_t(4) * validW_ * validH_, 0.0f);
-	else
+	} else {
+		bayerBuffer_.clear();
 		upscaleBuffer_.clear();
+	}
 
 	LOG(RPiDenoiseNcnn, Info)
 		<< "Bayer " << width_ << "x" << height_
-		<< " -> planes " << netW_ << "x" << netH_
+		<< " -> " << kChannels << " planes " << netW_ << "x" << netH_
 		<< " (pack " << packW_ << "x" << packH_ << ", valid " << validW_ << "x" << validH_ << ")";
 }
 
@@ -301,6 +339,19 @@ void DenoiseNcnn::computeAlignment()
 			continue;
 		}
 
+		/*
+		 * The first Convolution is the network's input layer: its
+		 * weight count (6) is num_output (0) x input channels x
+		 * kernel_w (1) x kernel_h (11, defaulting to kernel_w).
+		 */
+		if (type == "Convolution" && !inChannels_) {
+			int kw = params.count(1) ? params[1] : 1;
+			int kh = params.count(11) ? params[11] : kw;
+			int denom = (params.count(0) ? params[0] : 0) * kw * kh;
+			if (denom > 0 && params.count(6) && params[6] % denom == 0)
+				inChannels_ = params[6] / denom;
+		}
+
 		unsigned sw = std::max(1, params.count(3) ? params[3] : 1);
 		unsigned sh = std::max(1, params.count(13) ? params[13] : 1);
 		strideProdW *= sw;
@@ -312,12 +363,13 @@ void DenoiseNcnn::computeAlignment()
 
 	if (maxInterpW && maxInterpH) {
 		/*
-		 * The largest fixed Interp target is the shallowest (nearest
-		 * full-res) upsample stage, i.e. half the network's required
-		 * plane size.
+		 * The largest fixed Interp target is the shallowest upsample
+		 * stage, which restores the full network resolution for the
+		 * top-level skip connection, i.e. the network's required plane
+		 * size.
 		 */
-		fixedPlaneW_ = maxInterpW * 2;
-		fixedPlaneH_ = maxInterpH * 2;
+		fixedPlaneW_ = maxInterpW;
+		fixedPlaneH_ = maxInterpH;
 		LOG(RPiDenoiseNcnn, Info)
 			<< "Detected required plane size " << fixedPlaneW_ << "x" << fixedPlaneH_
 			<< " from Interp targets in " << param_
@@ -327,8 +379,39 @@ void DenoiseNcnn::computeAlignment()
 			<< "Detected required net-plane alignment " << alignW_ << "x" << alignH_
 			<< " from " << param_ << " (no fixed Interp targets found)";
 	}
+
+	if (!inChannels_)
+		LOG(RPiDenoiseNcnn, Warning)
+			<< "Couldn't determine input channel count from " << param_
+			<< ", assuming " << kChannels;
 }
 
+/*
+ * Zero the net-plane border beyond packW_ x packH_ in every channel, so
+ * the network sees black rather than stale data there.
+ */
+void DenoiseNcnn::zeroBorder()
+{
+	const unsigned netW = netW_, netH = netH_, packW = packW_, packH = packH_;
+
+	/* Single-threaded, as is packBayer(): it's only the (small) padding. */
+	for (int k = 0; k < int(kChannels); ++k) {
+		__fp16 *p = buffer_.data() + size_t(k) * planeStride_;
+		if (packW < netW) {
+			for (unsigned y = 0; y < packH; ++y)
+				std::fill(p + size_t(y) * netW + packW, p + size_t(y + 1) * netW,
+					  __fp16(0.0f));
+		}
+		memset(p + size_t(packH) * netW, 0, size_t(netH - packH) * netW * sizeof(__fp16));
+	}
+}
+
+/*
+ * Pack the raw Bayer frame into the network's 16 input planes: the 4
+ * Bayer planes, each further packed by space_to_depth(2), so network pixel
+ * (x,y) covers raw rows [4y,4y+4) and columns [4x,4x+4), with raw offset
+ * (dx,dy) going to channel rawToChannel(dx,dy).
+ */
 void DenoiseNcnn::packBayer(const uint16_t *bayer16, unsigned stridePx)
 {
 	if (downscale_) {
@@ -336,80 +419,59 @@ void DenoiseNcnn::packBayer(const uint16_t *bayer16, unsigned stridePx)
 		return;
 	}
 
-	const unsigned netW = netW_, netH = netH_, packW = packW_, packH = packH_;
-	const size_t plane = size_t(netW) * netH;
-	__fp16 *p0 = buffer_.data(); /* R  (x=0,y=0) */
-	__fp16 *p1 = p0 + plane; /* G1 (x=1,y=0) */
-	__fp16 *p2 = p1 + plane; /* G2 (x=0,y=1) */
-	__fp16 *p3 = p2 + plane; /* B  (x=1,y=1) */
+	const unsigned netW = netW_, packW = packW_, packH = packH_;
+	__fp16 *const base = buffer_.data();
+	const size_t plane = planeStride_;
 
 	constexpr float invMax = 1.0f / 65535.0f;
 #if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
 	const float32x4_t vInv = vdupq_n_f32(invMax);
 #endif
 
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(threads_) schedule(static)
-#endif
-	for (int y_ = 0; y_ < int(packH); ++y_) {
-		const unsigned y = unsigned(y_);
-		const uint16_t *row0 = bayer16 + size_t(2 * y) * stridePx;
-		const uint16_t *row1 = row0 + stridePx;
-		__fp16 *d0 = p0 + size_t(y) * netW;
-		__fp16 *d1 = p1 + size_t(y) * netW;
-		__fp16 *d2 = p2 + size_t(y) * netW;
-		__fp16 *d3 = p3 + size_t(y) * netW;
+	/*
+	 * Single-threaded, as is depthToRaw(): this is memory-bound, and
+	 * measured slower with more threads.
+	 */
+	for (unsigned y = 0; y < packH; ++y) {
+		for (unsigned dy = 0; dy < 4; ++dy) {
+			const uint16_t *row = bayer16 + size_t(4 * y + dy) * stridePx;
+			__fp16 *d[4];
+			for (unsigned dx = 0; dx < 4; ++dx)
+				d[dx] = base + rawToChannel(dx, dy) * plane + size_t(y) * netW;
 
-		unsigned x = 0;
+			unsigned x = 0;
 #if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
-		for (; x + 8 <= packW; x += 8) {
-			const uint16x8x2_t a = vld2q_u16(row0 + size_t(x) * 2);
-			const uint16x8x2_t b = vld2q_u16(row1 + size_t(x) * 2);
-			packStore8(d0 + x, a.val[0], vInv);
-			packStore8(d1 + x, a.val[1], vInv);
-			packStore8(d2 + x, b.val[0], vInv);
-			packStore8(d3 + x, b.val[1], vInv);
-		}
+			for (; x + 8 <= packW; x += 8) {
+				const uint16x8x4_t v = vld4q_u16(row + size_t(x) * 4);
+				packStore8(d[0] + x, v.val[0], vInv);
+				packStore8(d[1] + x, v.val[1], vInv);
+				packStore8(d[2] + x, v.val[2], vInv);
+				packStore8(d[3] + x, v.val[3], vInv);
+			}
 #endif
-		for (; x < packW; ++x) {
-			d0[x] = __fp16(float(row0[2 * x]) * invMax);
-			d1[x] = __fp16(float(row0[2 * x + 1]) * invMax);
-			d2[x] = __fp16(float(row1[2 * x]) * invMax);
-			d3[x] = __fp16(float(row1[2 * x + 1]) * invMax);
+			for (; x < packW; ++x) {
+				for (unsigned dx = 0; dx < 4; ++dx)
+					d[dx][x] = __fp16(float(row[4 * x + dx]) * invMax);
+			}
 		}
-		/* Zero the right-hand border for this row. */
-		for (unsigned c = packW; c < netW; ++c)
-			d0[c] = d1[c] = d2[c] = d3[c] = __fp16(0.0f);
 	}
 
-	/* Zero the bottom border rows, full width. */
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(threads_) schedule(static)
-#endif
-	for (int y_ = int(packH); y_ < int(netH); ++y_) {
-		const unsigned y = unsigned(y_);
-		memset(p0 + size_t(y) * netW, 0, netW * sizeof(__fp16));
-		memset(p1 + size_t(y) * netW, 0, netW * sizeof(__fp16));
-		memset(p2 + size_t(y) * netW, 0, netW * sizeof(__fp16));
-		memset(p3 + size_t(y) * netW, 0, netW * sizeof(__fp16));
-	}
+	zeroBorder();
 }
 
 /*
- * downscale_ variant: one net-plane pixel per 4x4 raw block (an extra
- * 2x2 box-average on top of the usual 2x2 Bayer-cell pack). Output pixel
- * (x,y) covers raw rows [4y,4y+4) and columns [4x,4x+4); each Bayer
- * colour's 4 samples in that block are averaged independently -- e.g. R
- * at block-relative (0,0),(2,0),(0,2),(2,2).
+ * downscale_ variant: first box-average each Bayer colour over 2x2 (each
+ * averaged sample covering a 4x4 raw block), then space_to_depth(2) as
+ * usual -- so network pixel (x,y) covers raw rows [8y,8y+8) and columns
+ * [8x,8x+8). Channel c*4 + i*2 + j holds colour c averaged over the 4x4
+ * raw block at raw rows [8y+4i,8y+4i+4) and columns [8x+4j,8x+4j+4); e.g.
+ * R at block-relative (0,0),(2,0),(0,2),(2,2).
  */
 void DenoiseNcnn::packBayerDownscale(const uint16_t *bayer16, unsigned stridePx)
 {
-	const unsigned netW = netW_, netH = netH_, packW = packW_, packH = packH_;
-	const size_t plane = size_t(netW) * netH;
-	__fp16 *p0 = buffer_.data(); /* R  */
-	__fp16 *p1 = p0 + plane; /* G1 */
-	__fp16 *p2 = p1 + plane; /* G2 */
-	__fp16 *p3 = p2 + plane; /* B  */
+	const unsigned netW = netW_, packW = packW_, packH = packH_;
+	__fp16 *const base = buffer_.data();
+	const size_t plane = planeStride_;
 
 	constexpr float invMax4 = 1.0f / (65535.0f * 4.0f);
 #if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
@@ -421,60 +483,56 @@ void DenoiseNcnn::packBayerDownscale(const uint16_t *bayer16, unsigned stridePx)
 #endif
 	for (int y_ = 0; y_ < int(packH); ++y_) {
 		const unsigned y = unsigned(y_);
-		const uint16_t *row0 = bayer16 + size_t(4 * y) * stridePx;
-		const uint16_t *row1 = row0 + stridePx;
-		const uint16_t *row2 = row1 + stridePx;
-		const uint16_t *row3 = row2 + stridePx;
-		__fp16 *d0 = p0 + size_t(y) * netW;
-		__fp16 *d1 = p1 + size_t(y) * netW;
-		__fp16 *d2 = p2 + size_t(y) * netW;
-		__fp16 *d3 = p3 + size_t(y) * netW;
+		for (unsigned i = 0; i < 2; ++i) {
+			const uint16_t *rows[4];
+			for (unsigned r = 0; r < 4; ++r)
+				rows[r] = bayer16 + size_t(8 * y + 4 * i + r) * stridePx;
+			/* d[c][j]: colour c, space-to-depth column j, this row i. */
+			__fp16 *d[4][2];
+			for (unsigned c = 0; c < 4; ++c)
+				for (unsigned j = 0; j < 2; ++j)
+					d[c][j] = base + (c * 4 + i * 2 + j) * plane + size_t(y) * netW;
 
-		unsigned x = 0;
+			unsigned x = 0;
 #if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
-		for (; x + 4 <= packW; x += 4) {
-			const uint16x8x2_t a0 = vld2q_u16(row0 + size_t(x) * 4); /* R,G1 from row0 */
-			const uint16x8x2_t a2 = vld2q_u16(row2 + size_t(x) * 4); /* R,G1 from row2 */
-			const uint16x8x2_t b1 = vld2q_u16(row1 + size_t(x) * 4); /* G2,B from row1 */
-			const uint16x8x2_t b3 = vld2q_u16(row3 + size_t(x) * 4); /* G2,B from row3 */
-			packStore4Sum4(d0 + x, a0.val[0], a2.val[0], vInv4);
-			packStore4Sum4(d1 + x, a0.val[1], a2.val[1], vInv4);
-			packStore4Sum4(d2 + x, b1.val[0], b3.val[0], vInv4);
-			packStore4Sum4(d3 + x, b1.val[1], b3.val[1], vInv4);
-		}
+			for (; x + 4 <= packW; x += 4) {
+				/* Lane l of val[dx]: raw column 8x + 4l + dx, i.e. 4x4 block 2x + l. */
+				uint16x8x4_t v[4];
+				for (unsigned r = 0; r < 4; ++r)
+					v[r] = vld4q_u16(rows[r] + size_t(x) * 8);
+				for (unsigned c = 0; c < 4; ++c) {
+					const unsigned cx = c & 1, cy = c >> 1;
+					packStore4x2Sum4(d[c][0] + x, d[c][1] + x,
+							 v[cy].val[cx], v[cy].val[cx + 2],
+							 v[cy + 2].val[cx], v[cy + 2].val[cx + 2], vInv4);
+				}
+			}
 #endif
-		for (; x < packW; ++x) {
-			const unsigned rb = 4 * x;
-			float r = float(row0[rb + 0]) + row0[rb + 2] + row2[rb + 0] + row2[rb + 2];
-			float g1 = float(row0[rb + 1]) + row0[rb + 3] + row2[rb + 1] + row2[rb + 3];
-			float g2 = float(row1[rb + 0]) + row1[rb + 2] + row3[rb + 0] + row3[rb + 2];
-			float b = float(row1[rb + 1]) + row1[rb + 3] + row3[rb + 1] + row3[rb + 3];
-			d0[x] = __fp16(r * invMax4);
-			d1[x] = __fp16(g1 * invMax4);
-			d2[x] = __fp16(g2 * invMax4);
-			d3[x] = __fp16(b * invMax4);
+			for (; x < packW; ++x) {
+				for (unsigned c = 0; c < 4; ++c) {
+					const unsigned cx = c & 1, cy = c >> 1;
+					for (unsigned j = 0; j < 2; ++j) {
+						const unsigned col = 8 * x + 4 * j + cx;
+						float sum = float(rows[cy][col]) + rows[cy][col + 2] +
+							    rows[cy + 2][col] + rows[cy + 2][col + 2];
+						d[c][j][x] = __fp16(sum * invMax4);
+					}
+				}
+			}
 		}
-		/* Zero the right-hand border for this row. */
-		for (unsigned c = packW; c < netW; ++c)
-			d0[c] = d1[c] = d2[c] = d3[c] = __fp16(0.0f);
 	}
 
-	/* Zero the bottom border rows, full width. */
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(threads_) schedule(static)
-#endif
-	for (int y_ = int(packH); y_ < int(netH); ++y_) {
-		const unsigned y = unsigned(y_);
-		memset(p0 + size_t(y) * netW, 0, netW * sizeof(__fp16));
-		memset(p1 + size_t(y) * netW, 0, netW * sizeof(__fp16));
-		memset(p2 + size_t(y) * netW, 0, netW * sizeof(__fp16));
-		memset(p3 + size_t(y) * netW, 0, netW * sizeof(__fp16));
-	}
+	zeroBorder();
 }
 
 bool DenoiseNcnn::runNet(ncnn::Mat &out)
 {
-	ncnn::Mat in(int(netW_), int(netH_), 4, (void *)buffer_.data(), size_t(2u));
+	ncnn::Mat in(int(netW_), int(netH_), int(kChannels), (void *)buffer_.data(), size_t(2u));
+	if (in.cstep != planeStride_) {
+		LOG(RPiDenoiseNcnn, Error)
+			<< "ncnn plane stride " << in.cstep << " != expected " << planeStride_;
+		return false;
+	}
 
 	ncnn::Extractor ex = net_.create_extractor();
 	if (ex.input(kInputBlob, in) != 0) {
@@ -487,26 +545,109 @@ bool DenoiseNcnn::runNet(ncnn::Mat &out)
 	}
 
 	/*
-	 * out.c < 4 would mean ncnn hasn't unpacked the final blob back to
+	 * out.c != 16 would mean ncnn hasn't unpacked the final blob back to
 	 * separate channel planes (elempack > 1) -- catch that here rather
 	 * than reading out-of-bounds channels below.
 	 */
-	return out.c >= 4 && (unsigned)out.w == netW_ && (unsigned)out.h == netH_;
+	return (unsigned)out.c == kChannels && out.elempack == 1 && out.elemsize == sizeof(float) &&
+	       (unsigned)out.w == netW_ && (unsigned)out.h == netH_;
 }
 
 void DenoiseNcnn::unpackBayer(uint16_t *bayer16, unsigned stridePx, const ncnn::Mat &out)
 {
 	if (downscale_) {
-		upscale2x(out);
+		depthToSpace(out);
+		const size_t bayerPlane = size_t(bayerW_) * bayerH_;
 		const size_t plane = size_t(validW_) * validH_;
+		for (unsigned c = 0; c < 4; c++)
+			upscaleChannel2x(bayerBuffer_.data() + c * bayerPlane, bayerW_, bayerW_, bayerH_,
+					 upscaleBuffer_.data() + c * plane, validW_, validH_);
 		interleaveToRaw(bayer16, stridePx, upscaleBuffer_.data() + 0 * plane,
-				 upscaleBuffer_.data() + 1 * plane, upscaleBuffer_.data() + 2 * plane,
-				 upscaleBuffer_.data() + 3 * plane, validW_);
+				upscaleBuffer_.data() + 1 * plane, upscaleBuffer_.data() + 2 * plane,
+				upscaleBuffer_.data() + 3 * plane, validW_);
 		return;
 	}
 
-	interleaveToRaw(bayer16, stridePx, out.channel(0), out.channel(1), out.channel(2),
-			 out.channel(3), netW_);
+	depthToRaw(bayer16, stridePx, out);
+}
+
+/*
+ * Inverse of packBayer(): write each network output pixel's 16 channels
+ * straight back over its 4x4 raw block.
+ */
+void DenoiseNcnn::depthToRaw(uint16_t *bayer16, unsigned stridePx, const ncnn::Mat &out)
+{
+	const unsigned netW = netW_, packW = packW_, packH = packH_;
+
+#if defined(__ARM_NEON)
+	const float32x4_t vScaleMax = vdupq_n_f32(65535.0f);
+#endif
+
+	/*
+	 * Single-threaded, as is packBayer(): this is memory-bound, and
+	 * measured slower with more threads.
+	 */
+	for (unsigned y = 0; y < packH; ++y) {
+		for (unsigned dy = 0; dy < 4; ++dy) {
+			uint16_t *row = bayer16 + size_t(4 * y + dy) * stridePx;
+			const float *s[4];
+			for (unsigned dx = 0; dx < 4; ++dx)
+				s[dx] = static_cast<const float *>(out.channel(rawToChannel(dx, dy))) +
+					size_t(y) * netW;
+
+			unsigned x = 0;
+#if defined(__ARM_NEON)
+			for (; x + 4 <= packW; x += 4) {
+				const uint16x4x4_t v{ unpackLoad4(s[0] + x, vScaleMax),
+						      unpackLoad4(s[1] + x, vScaleMax),
+						      unpackLoad4(s[2] + x, vScaleMax),
+						      unpackLoad4(s[3] + x, vScaleMax) };
+				vst4_u16(row + size_t(x) * 4, v);
+			}
+#endif
+			for (; x < packW; ++x) {
+				for (unsigned dx = 0; dx < 4; ++dx)
+					row[4 * x + dx] = quantise(s[dx][x]);
+			}
+		}
+	}
+}
+
+/*
+ * downscale_ only: depth_to_space(2) the network's 16 output channels back
+ * into 4 quarter-res Bayer planes (bayerBuffer_, bayerW_ x bayerH_ each),
+ * ready for upscaleChannel2x().
+ */
+void DenoiseNcnn::depthToSpace(const ncnn::Mat &out)
+{
+	const unsigned netW = netW_, packW = packW_, packH = packH_, bayerW = bayerW_;
+	const size_t bayerPlane = size_t(bayerW_) * bayerH_;
+
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads_) schedule(static)
+#endif
+	for (int cy_ = 0; cy_ < int(4 * packH); ++cy_) {
+		const unsigned c = unsigned(cy_) / packH, y = unsigned(cy_) % packH;
+		for (unsigned i = 0; i < 2; ++i) {
+			float *dst = bayerBuffer_.data() + c * bayerPlane + size_t(2 * y + i) * bayerW;
+			const float *s0 = static_cast<const float *>(out.channel(c * 4 + i * 2 + 0)) +
+					  size_t(y) * netW;
+			const float *s1 = static_cast<const float *>(out.channel(c * 4 + i * 2 + 1)) +
+					  size_t(y) * netW;
+
+			unsigned x = 0;
+#if defined(__ARM_NEON)
+			for (; x + 4 <= packW; x += 4) {
+				const float32x4x2_t v{ vld1q_f32(s0 + x), vld1q_f32(s1 + x) };
+				vst2q_f32(dst + 2 * x, v);
+			}
+#endif
+			for (; x < packW; ++x) {
+				dst[2 * x] = s0[x];
+				dst[2 * x + 1] = s1[x];
+			}
+		}
+	}
 }
 
 void DenoiseNcnn::interleaveToRaw(uint16_t *bayer16, unsigned stridePx, const float *R,
@@ -548,21 +689,6 @@ void DenoiseNcnn::interleaveToRaw(uint16_t *bayer16, unsigned stridePx, const fl
 			row1[2 * x + 1] = quantise(s3[x]);
 		}
 	}
-}
-
-/*
- * downscale_ only: bilinearly upscale each of the network's 4 quarter-res
- * output planes (out.channel(c), netW_ x netH_, valid region packW_ x
- * packH_) by exactly 2x in each dimension into upscaleBuffer_ (validW_ x
- * validH_ == packW_*2 x packH_*2 by construction), ready for
- * interleaveToRaw().
- */
-void DenoiseNcnn::upscale2x(const ncnn::Mat &out)
-{
-	const size_t plane = size_t(validW_) * validH_;
-	for (int c = 0; c < 4; c++)
-		upscaleChannel2x(out.channel(c), netW_, packW_, packH_,
-				  upscaleBuffer_.data() + size_t(c) * plane, validW_, validH_);
 }
 
 /*
