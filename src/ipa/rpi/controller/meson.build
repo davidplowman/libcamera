@@ -23,7 +23,6 @@ rpi_ipa_controller_sources = files([
     'rpi/global_motion.cpp',
     'rpi/hdr.cpp',
     'rpi/lux.cpp',
-    'rpi/model_denoise.cpp',
     'rpi/noise.cpp',
     'rpi/saturation.cpp',
     'rpi/sdn.cpp',
@@ -46,32 +45,39 @@ if tflite_dep.found()
     rpi_ipa_controller_deps += tflite_dep
 endif
 
+# BSTM (Brainstorm) NPU denoise, run through Mesa's Teflon TFLite delegate.
+# libteflon.so is loaded by the TFLite runtime at run time rather than
+# linked, so all that's needed here is to find it (and the bstm driver's
+# compiler library, installed next to it, without which nothing runs on the
+# NPU). Mesa ships no pkg-config file for either.
+fs = import('fs')
+teflon_dirs = get_option('rpi-teflon-dir') != '' ? [get_option('rpi-teflon-dir')] : [
+    get_option('prefix') / get_option('libdir'),
+    '/usr/local/lib/aarch64-linux-gnu',
+    '/usr/lib/aarch64-linux-gnu',
+]
+teflon_path = ''
+if tflite_dep.found() and cxx.has_header('tensorflow/lite/delegates/external/external_delegate.h',
+                                         dependencies : tflite_dep)
+    foreach dir : teflon_dirs
+        if teflon_path == '' and fs.exists(dir / 'libteflon.so') and fs.exists(dir / 'libbstm_compiler.so')
+            teflon_path = dir / 'libteflon.so'
+        endif
+    endforeach
+endif
+
+if teflon_path != ''
+    rpi_ipa_controller_sources += files([
+        'rpi/denoise_bstm.cpp',
+    ])
+    rpi_ipa_controller_deps += declare_dependency(
+        compile_args : ['-DRPI_TEFLON_PATH="@0@"'.format(teflon_path)])
+endif
+summary({'BSTM NPU denoise' : teflon_path != '' ? teflon_path : false},
+        section : 'Raspberry Pi IPA')
+
 ncnn_dep = dependency('ncnn', required : true).as_system()
 rpi_ipa_controller_deps += ncnn_dep
-
-# BSTM (BrainStorm) NPU offload of the model_denoise predictor trunk.
-# The SDK ships no pkg-config file and installs nowhere standard, so the
-# tree is located by the bstm_root option rather than probed for. Absent or
-# incomplete, model_denoise still builds and runs everything on the CPU --
-# RPI_HAVE_BSTM simply stays undefined.
-bstm_root = get_option('bstm_root')
-if bstm_root != ''
-    bstm_inc = bstm_root / 'core' / 'include'
-    # The 'target' flavour is the one with client mode compiled in, which
-    # is what lets us share the NPU with the running bstorm daemon.
-    bstm_lib = cxx.find_library('bstorm_core',
-                                dirs : [bstm_root / 'core' / 'out' / 'core.7712c0.2.64.target'],
-                                required : false)
-    if bstm_lib.found() and cxx.has_header('bstorm_init.h', args : ['-I' + bstm_inc])
-        rpi_ipa_controller_deps += declare_dependency(
-            dependencies : bstm_lib,
-            include_directories : include_directories(bstm_inc, is_system : true),
-            compile_args : ['-DRPI_HAVE_BSTM'])
-        summary({'BSTM NPU offload' : bstm_root}, section : 'Raspberry Pi IPA')
-    else
-        warning('bstm_root set but libbstorm_core / core/include not found under ' + bstm_root)
-    endif
-endif
 
 # ncnn is built with NCNN_OPENMP, so its static library pulls in undefined
 # GOMP_parallel/omp_* references that ncnn.pc does not declare a dependency
