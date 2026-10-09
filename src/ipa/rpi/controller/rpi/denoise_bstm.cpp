@@ -804,7 +804,7 @@ void DenoiseBstm::upscaleChannel2x(const float *src, unsigned srcStride, unsigne
 
 void DenoiseBstm::prepare(Metadata *imageMetadata)
 {
-	std::pair<SharedFD, Span<uint8_t>> bayer;
+	std::pair<SharedFD, std::span<uint8_t>> bayer;
 	imageMetadata->get("global.bayer_buffer", bayer);
 
 	if (!init_ || !bayer.second.data() || !width_ || !height_)
@@ -812,7 +812,7 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 
 	dmabufSyncStart(bayer.first);
 
-	uint16_t *bayer16 = reinterpret_cast<uint16_t *>(bayer.second.begin());
+	uint16_t *bayer16 = reinterpret_cast<uint16_t *>(bayer.second.data());
 	const unsigned stridePx = (bayer.second.size() / height_) / sizeof(uint16_t);
 
 	/*

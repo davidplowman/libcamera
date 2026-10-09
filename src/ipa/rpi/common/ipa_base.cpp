@@ -498,7 +498,7 @@ void IpaBase::prepareIsp(const PrepareParams &params)
 		auto bayer_fd_it = buffersFds_.find(params.buffers.bayer);
 		ASSERT(bayer_it != buffers_.end());
 		rpiMetadata.set("global.bayer_buffer",
-				std::pair<SharedFD, Span<uint8_t>> {bayer_fd_it->second, bayer_it->second.planes()[0]});
+				std::pair<SharedFD, std::span<uint8_t>> {bayer_fd_it->second, bayer_it->second.planes()[0]});
 	}
 
 	/* Allow a 10% margin on the comparison below. */

@@ -414,7 +414,7 @@ void IpaPiSP::platformPrepareIsp([[maybe_unused]] const PrepareParams &params,
 			gammaCurve.push_back(y);
 		});
 		libcameraMetadata_.set(controls::rpi::GammaCurve,
-				       Span<const float>(gammaCurve.data(), gammaCurve.size()));
+				       std::span<const float>(gammaCurve.data(), gammaCurve.size()));
 	}
 
 	CcmStatus *ccmStatus = rpiMetadata.getLocked<CcmStatus>("ccm.status");
