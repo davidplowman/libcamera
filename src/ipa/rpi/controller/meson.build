@@ -69,6 +69,7 @@ endif
 if teflon_path != ''
     rpi_ipa_controller_sources += files([
         'rpi/denoise_bstm.cpp',
+        'rpi/denoise_bstm_temporal.cpp',
     ])
     rpi_ipa_controller_deps += declare_dependency(
         compile_args : ['-DRPI_TEFLON_PATH="@0@"'.format(teflon_path)])

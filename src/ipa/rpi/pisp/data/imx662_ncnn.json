@@ -108,7 +108,7 @@
             }
         },
         {
-            "rpi.denoise_bstm": {
+            "x.rpi.denoise_bstm": {
                 "model": "/home/pi/libcamera/src/ipa/rpi/pisp/data/tflite/imx662_64_2e11_16x274x484_int8.tflite",
 		"residual": true,
 		"float_format": "bf16",
@@ -116,8 +116,22 @@
                 "downscale": false,
                 "demo": true,
                 "sdn_disable": true,
-                "tdn_disable": false,
+                "tdn_disable": true,
                 "cdn_disable": false
+            }
+        },
+        {
+            "rpi.denoise_bstm_temporal": {
+                "model": "/home/pi/libcamera/src/ipa/rpi/pisp/data/tflite/imx662_temporal_64_2e12_16x274x484_g32-192_c025_d100_int8.tflite",
+                "float_format": "bf16",
+                "threads": 2,
+                "cpu": false,
+                "cpu_threads": 3,
+                "reset_ratio": 2.0,
+                "demo": true,
+                "sdn_factor": 0.005,
+                "tdn_factor": 0.0,
+                "cdn_factor": 1.0
             }
         },
         {
