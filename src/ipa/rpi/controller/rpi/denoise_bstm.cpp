@@ -2,19 +2,21 @@
 /*
  * Copyright (C) 2026, Raspberry Pi Ltd
  *
- * Simple full-frame denoise control algorithm on the BSTM NPU
+ * Recurrent full-frame denoise control algorithm on the BSTM NPU
  */
 
 #include "denoise_bstm.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <errno.h>
+#include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <type_traits>
 
 #include <linux/dma-buf.h>
 
@@ -28,6 +30,7 @@
 #include <tensorflow/lite/kernels/register.h>
 
 #include "../denoise_status.h"
+#include "../device_status.h"
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -58,49 +61,14 @@ void dmabufSyncEnd(const SharedFD &fd)
 	::ioctl(fd.get(), DMA_BUF_IOCTL_SYNC, &dma_sync);
 }
 
-#if defined(__ARM_NEON)
 /*
- * 4 fp32 samples v -> 4 uint16 samples v * 65535 + base in [0,65535],
- * rounded to nearest and clamped. base is 0, or with residual_ the raw
- * input samples the network's output is a correction to. vcvtaq_u32_f32
- * (FCVTAU) rounds to nearest and saturates negative/NaN to 0 and overflow
- * to UINT32_MAX; vqmovn_u32 then saturates that down to the uint16 range --
- * so the clamp to [0,65535] falls out of the hardware conversion, no extra
- * compare/select needed. The multiply-add is fused, as in quantise(), so
- * both give identical results.
- */
-inline uint16x4_t toRaw4(float32x4_t v, float32x4_t base, float32x4_t scaleMax)
-{
-	return vqmovn_u32(vcvtaq_u32_f32(vfmaq_f32(base, v, scaleMax)));
-}
-
-inline float32x4_t rawToFloat4(uint16x4_t v)
-{
-	return vcvtq_f32_u32(vmovl_u16(v));
-}
-#endif
-
-/*
- * Scalar v * scaleMax + base, rounded and clamped to [0,65535] (see
- * toRaw4()). scaleMax is 65535, or 65535 times an int8 output tensor's
- * scale when v is its (q - zero point).
- */
-inline uint16_t quantise(float v, float base = 0.0f, float scaleMax = 65535.0f)
-{
-	v = std::fma(v, scaleMax, base);
-	v = v < 0.0f ? 0.0f : (v > 65535.0f ? 65535.0f : v);
-	return uint16_t(std::lround(v));
-}
-
-/*
- * The network's input/output is the 4 Bayer planes (R, G1, G2, B, i.e.
- * raw 2x2-cell positions (0,0), (1,0), (0,1), (1,1)) further packed by
- * space_to_depth(2) (PyTorch pixel_unshuffle): channel c*4 + i*2 + j holds
- * Bayer plane c's (row i, column j) sub-position within each 2x2 block of
- * that plane. The TFLite tensor is NHWC, so each network pixel's 16
- * channels are consecutive. Without downscale_, a network pixel covers
- * one 4x4 raw block, and this returns the channel holding raw offset
- * (dx, dy) within that block.
+ * The network's x and prev inputs, and its r output, are the 4 Bayer planes
+ * (raw 2x2-cell positions (0,0), (1,0), (0,1), (1,1)) further packed by
+ * space_to_depth(2): channel c*4 + i*2 + j holds Bayer plane c's (row i,
+ * column j) sub-position within each 2x2 block of that plane. The tensors
+ * are NHWC, so each network pixel's 16 channels are consecutive, and a
+ * network pixel covers one 4x4 raw block. This returns the channel holding
+ * raw offset (dx, dy) within that block.
  */
 constexpr unsigned rawToChannel(unsigned dx, unsigned dy)
 {
@@ -108,6 +76,86 @@ constexpr unsigned rawToChannel(unsigned dx, unsigned dy)
 }
 
 constexpr unsigned kChannels = 16;
+
+/* 12-bit raw data, padded with zeros at the bottom: tables are indexed by raw >> 4. */
+constexpr unsigned kRawShift = 4;
+constexpr unsigned kTableSize = 65536 >> kRawShift;
+
+using Clock = std::chrono::steady_clock;
+
+double msSince(Clock::time_point t)
+{
+	return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+}
+
+/*
+ * The current frame's square root for network pixel x, in channel order,
+ * looked up from the raw values (rows[dy] being raw row 4y + dy).
+ */
+/*
+ * Scale the classic PISP denoise stage's status (tag) by factor, using
+ * scale(status, factor), or with a factor of 0 erase it so the stage doesn't
+ * run at all on a frame we've already denoised. 1 leaves it untouched.
+ */
+template<typename T, typename F>
+void scaleStatus(Metadata *imageMetadata, const char *tag, double factor, F scale)
+{
+	if (factor == 0.0) {
+		imageMetadata->erase(tag);
+		return;
+	}
+	if (factor == 1.0)
+		return;
+
+	T status;
+	if (imageMetadata->get(tag, status) == 0) {
+		scale(status, factor);
+		imageMetadata->set(tag, status);
+	}
+}
+
+inline void gatherSqrt(uint16_t *const rows[4], unsigned x, const float *table, float *xf)
+{
+	for (unsigned dy = 0; dy < 4; ++dy) {
+		const uint16_t *r = rows[dy] + 4 * x;
+		for (unsigned dx = 0; dx < 4; ++dx)
+			xf[rawToChannel(dx, dy)] = table[r[dx] >> kRawShift];
+	}
+}
+
+#if defined(__ARM_NEON)
+/*
+ * Square network pixel x's 16 channels (in [0, 1]) back to linear, scale to
+ * 16 bits and write them over its 4x4 raw block. FCVTAU rounds to nearest
+ * and saturates, and vqmovn_u32 saturates again to uint16, so no clamp is
+ * needed. The 4 channel registers hold raw row dy's samples, in dx order,
+ * as (see rawToChannel()):
+ * dy=0: zip1(c0-3, c4-7) = 0,4,1,5    dy=1: zip1(c8-11, c12-15) = 8,12,9,13
+ * dy=2: zip2(c0-3, c4-7) = 2,6,3,7    dy=3: zip2(c8-11, c12-15) = 10,14,11,15
+ */
+inline void writeRaw(uint16_t *const rows[4], unsigned x, const float32x4x4_t &out)
+{
+	const float32x4_t vRawMax = vdupq_n_f32(65535.0f);
+	float32x4_t lin[4];
+	for (unsigned i = 0; i < 4; ++i)
+		lin[i] = vmulq_f32(out.val[i], vmulq_f32(out.val[i], vRawMax));
+	const float32x4_t rowv[4] = { vzip1q_f32(lin[0], lin[1]), vzip1q_f32(lin[2], lin[3]),
+				      vzip2q_f32(lin[0], lin[1]), vzip2q_f32(lin[2], lin[3]) };
+	for (unsigned dy = 0; dy < 4; ++dy)
+		vst1_u16(rows[dy] + 4 * x, vqmovn_u32(vcvtaq_u32_f32(rowv[dy])));
+}
+#else
+inline void writeRaw(uint16_t *const rows[4], unsigned x, const float *out)
+{
+	for (unsigned dy = 0; dy < 4; ++dy) {
+		uint16_t *r = rows[dy] + 4 * x;
+		for (unsigned dx = 0; dx < 4; ++dx) {
+			const float o = out[rawToChannel(dx, dy)];
+			r[dx] = uint16_t(std::lround(std::min(o * (o * 65535.0f), 65535.0f)));
+		}
+	}
+}
+#endif
 
 } /* namespace */
 
@@ -134,24 +182,46 @@ int DenoiseBstm::read(const libcamera::ValueNode &params)
 	model_ = params["model"].get<std::string>("");
 	delegate_ = params["delegate"].get<std::string>(RPI_TEFLON_PATH);
 	floatFormat_ = params["float_format"].get<std::string>("bf16");
-	sdn_disable_ = params["sdn_disable"].get<bool>(true);
-	tdn_disable_ = params["tdn_disable"].get<bool>(true);
-	cdn_disable_ = params["cdn_disable"].get<bool>(true);
+	sdnFactor_ = params["sdn_factor"].get<double>(0.0);
+	tdnFactor_ = params["tdn_factor"].get<double>(0.0);
+	cdnFactor_ = params["cdn_factor"].get<double>(0.0);
 
 	threads_ = params["threads"].get<int>(2);
-	downscale_ = params["downscale"].get<bool>(false);
+	cpu_ = params["cpu"].get<bool>(false);
+	cpuThreads_ = params["cpu_threads"].get<int>(3);
 	demo_ = params["demo"].get<bool>(false);
-	residual_ = params["residual"].get<bool>(false);
+	resetRatio_ = params["reset_ratio"].get<double>(2.0);
+
+	dumpDir_ = params["dump_dir"].get<std::string>("");
+	dumpFrames_ = params["dump_frames"].get<unsigned>(0);
 
 	if (model_.empty()) {
 		LOG(RPiDenoiseBstm, Error) << "\"model\" must be supplied";
 		return -EINVAL;
 	}
 
-	if (floatFormat_ != "fp32" && floatFormat_ != "bf16" && floatFormat_ != "fp16") {
+	for (const char *stage : { "sdn", "tdn", "cdn" }) {
+		const std::string old = std::string(stage) + "_disable";
+		if (params.contains(old))
+			LOG(RPiDenoiseBstm, Warning)
+				<< "\"" << old << "\" is no longer supported and is ignored; use \""
+				<< stage << "_factor\" (0 disables the stage, 1 leaves it as it is)";
+	}
+
+	if (sdnFactor_ < 0.0 || tdnFactor_ < 0.0 || cdnFactor_ < 0.0) {
 		LOG(RPiDenoiseBstm, Error)
-			<< "\"float_format\" must be \"fp32\", \"bf16\" or \"fp16\", not \""
-			<< floatFormat_ << "\"";
+			<< "\"sdn_factor\", \"tdn_factor\" and \"cdn_factor\" must not be negative";
+		return -EINVAL;
+	}
+
+	if (floatFormat_ != "bf16" && floatFormat_ != "fp16") {
+		LOG(RPiDenoiseBstm, Error)
+			<< "\"float_format\" must be \"bf16\" or \"fp16\", not \"" << floatFormat_ << "\"";
+		return -EINVAL;
+	}
+
+	if (!(resetRatio_ > 1.0)) {
+		LOG(RPiDenoiseBstm, Error) << "\"reset_ratio\" must be greater than 1";
 		return -EINVAL;
 	}
 
@@ -159,17 +229,17 @@ int DenoiseBstm::read(const libcamera::ValueNode &params)
 }
 
 /*
- * A model input or output must be [1, H, W, 16], float32 or int8. An int8
- * tensor must be quantised per tensor (a single scale and zero point),
+ * A model input or output must be [1, H, W, channels], float32 or int8. An
+ * int8 tensor must be quantised per tensor (a single scale and zero point),
  * which are returned in scale and zp.
  */
-bool DenoiseBstm::checkTensor(const TfLiteTensor *t, const char *what, bool &isInt8,
-			      float &scale, int &zp)
+bool DenoiseBstm::checkTensor(const TfLiteTensor *t, const char *what, int channels,
+				      bool &isInt8, float &scale, int &zp)
 {
 	if (!t || !t->dims || t->dims->size != 4 || t->dims->data[0] != 1 ||
-	    t->dims->data[3] != int(kChannels)) {
+	    t->dims->data[3] != channels) {
 		LOG(RPiDenoiseBstm, Error)
-			<< model_ << ": " << what << " must be [1, H, W, " << kChannels << "]";
+			<< model_ << ": " << what << " must be [1, H, W, " << channels << "]";
 		return false;
 	}
 
@@ -178,23 +248,25 @@ bool DenoiseBstm::checkTensor(const TfLiteTensor *t, const char *what, bool &isI
 		return true;
 	}
 
-	if (t->type == kTfLiteInt8) {
-		const auto *q = static_cast<const TfLiteAffineQuantization *>(t->quantization.params);
-		if (t->quantization.type != kTfLiteAffineQuantization || !q || !q->scale ||
-		    q->scale->size != 1 || !(t->params.scale > 0.0f)) {
-			LOG(RPiDenoiseBstm, Error)
-				<< model_ << ": int8 " << what << " must have a single (per-tensor) scale";
-			return false;
-		}
-		isInt8 = true;
-		scale = t->params.scale;
-		zp = t->params.zero_point;
-		return true;
+	if (t->type != kTfLiteInt8) {
+		LOG(RPiDenoiseBstm, Error)
+			<< model_ << ": " << what << " must be float32 or int8, not "
+			<< TfLiteTypeGetName(t->type);
+		return false;
 	}
 
-	LOG(RPiDenoiseBstm, Error)
-		<< model_ << ": " << what << " must be float32 or int8, not " << TfLiteTypeGetName(t->type);
-	return false;
+	const auto *q = static_cast<const TfLiteAffineQuantization *>(t->quantization.params);
+	if (t->quantization.type != kTfLiteAffineQuantization || !q || !q->scale ||
+	    q->scale->size != 1 || !(t->params.scale > 0.0f)) {
+		LOG(RPiDenoiseBstm, Error)
+			<< model_ << ": " << what << " must have a single (per-tensor) scale";
+		return false;
+	}
+
+	isInt8 = true;
+	scale = t->params.scale;
+	zp = t->params.zero_point;
+	return true;
 }
 
 void DenoiseBstm::initialise()
@@ -205,28 +277,52 @@ void DenoiseBstm::initialise()
 		return;
 	}
 
-	tflite::ops::builtin::BuiltinOpResolver resolver;
-	tflite::InterpreterBuilder(*flatbuffer_, resolver)(&interpreter_);
+	/*
+	 * On the CPU, BuiltinOpResolverWithXNNPACK asks TFLite to apply its
+	 * default XNNPACK delegate, for float and int8 alike, which is about 3x
+	 * faster for this network. Debian's libtensorflow-lite is built without
+	 * XNNPACK, though (its MaybeCreateXNNPACKDelegate() returns nullptr),
+	 * so there this runs on TFLite's builtin kernels, and the log shows 0
+	 * nodes delegated. The resolver must outlive AllocateTensors(), where
+	 * a default delegate would be applied.
+	 */
+	std::unique_ptr<tflite::ops::builtin::BuiltinOpResolver> resolver;
+	if (cpu_)
+		resolver = std::make_unique<tflite::ops::builtin::BuiltinOpResolverWithXNNPACK>();
+	else
+		resolver = std::make_unique<tflite::ops::builtin::BuiltinOpResolver>();
+	tflite::InterpreterBuilder(*flatbuffer_, *resolver)(&interpreter_);
 	if (!interpreter_) {
 		LOG(RPiDenoiseBstm, Error) << "Failed to build TFLite interpreter for " << model_;
 		return;
 	}
-	interpreter_->SetNumThreads(threads_);
+	/* This also sets the threads of TFLite's default CPU (XNNPACK) delegate. */
+	interpreter_->SetNumThreads(cpu_ ? cpuThreads_ : threads_);
 
-	/* Read by the bstm driver when the delegate opens the NPU. */
-	setenv("BSTM_FLOAT", floatFormat_.c_str(), 0);
+	if (!cpu_) {
+		/*
+		 * Read by the bstm driver when the delegate opens the NPU, so it
+		 * must be set before then; the inputs' type is already known.
+		 */
+		if (!interpreter_->inputs().empty() &&
+		    interpreter_->tensor(interpreter_->inputs()[0])->type == kTfLiteFloat32)
+			setenv("BSTM_FLOAT", floatFormat_.c_str(), 0);
 
-	TfLiteExternalDelegateOptions options = TfLiteExternalDelegateOptionsDefault(delegate_.c_str());
-	tfDelegate_ = TfLiteExternalDelegateCreate(&options);
-	if (!tfDelegate_) {
-		LOG(RPiDenoiseBstm, Error) << "Failed to create the Teflon delegate from " << delegate_;
-		return;
-	}
+		TfLiteExternalDelegateOptions options =
+			TfLiteExternalDelegateOptionsDefault(delegate_.c_str());
+		tfDelegate_ = TfLiteExternalDelegateCreate(&options);
+		if (!tfDelegate_) {
+			LOG(RPiDenoiseBstm, Error)
+				<< "Failed to create the Teflon delegate from " << delegate_;
+			return;
+		}
 
-	/* This is where the driver compiles the model (or finds it in its disk cache). */
-	if (interpreter_->ModifyGraphWithDelegate(tfDelegate_) != kTfLiteOk) {
-		LOG(RPiDenoiseBstm, Error) << "Failed to apply the Teflon delegate to " << model_;
-		return;
+		/* This is where the driver compiles the model (or finds it in its disk cache). */
+		if (interpreter_->ModifyGraphWithDelegate(tfDelegate_) != kTfLiteOk) {
+			LOG(RPiDenoiseBstm, Error)
+				<< "Failed to apply the Teflon delegate to " << model_;
+			return;
+		}
 	}
 
 	if (interpreter_->AllocateTensors() != kTfLiteOk) {
@@ -234,6 +330,10 @@ void DenoiseBstm::initialise()
 		return;
 	}
 
+	/*
+	 * With cpu_, any delegate nodes are TFLite's own default CPU delegate
+	 * (XNNPACK), applied by AllocateTensors(); otherwise they're the NPU.
+	 */
 	unsigned delegated = 0;
 	const std::vector<int> &plan = interpreter_->execution_plan();
 	for (int node : plan) {
@@ -241,68 +341,134 @@ void DenoiseBstm::initialise()
 		if (nr && nr->second.builtin_code == kTfLiteBuiltinDelegate)
 			delegated++;
 	}
-	if (!delegated)
+	if (!cpu_ && !delegated)
 		LOG(RPiDenoiseBstm, Warning) << "No part of " << model_ << " runs on the NPU";
-	else if (delegated != plan.size())
+	else if (!cpu_ && delegated != plan.size())
 		LOG(RPiDenoiseBstm, Warning)
 			<< model_ << ": " << plan.size() - delegated << " of " << plan.size()
 			<< " execution-plan nodes run on the CPU";
 
-	if (interpreter_->inputs().size() != 1 || interpreter_->outputs().size() != 1) {
-		LOG(RPiDenoiseBstm, Error) << model_ << " must have exactly one input and one output";
-		return;
-	}
-	const TfLiteTensor *in = interpreter_->input_tensor(0);
-	const TfLiteTensor *out = interpreter_->output_tensor(0);
-	if (!checkTensor(in, "input", inInt8_, inScale_, inZp_) ||
-	    !checkTensor(out, "output", outInt8_, outScale_, outZp_))
-		return;
-	if (out->dims->data[1] != in->dims->data[1] || out->dims->data[2] != in->dims->data[2]) {
-		LOG(RPiDenoiseBstm, Error) << model_ << ": output size must match input size";
+	if (interpreter_->inputs().size() != 2 || interpreter_->outputs().size() != 2) {
+		LOG(RPiDenoiseBstm, Error)
+			<< model_ << " must have exactly two inputs (x, prev) and two outputs (r, a)";
 		return;
 	}
 
-	netH_ = in->dims->data[1];
-	netW_ = in->dims->data[2];
+	/*
+	 * The inputs have the same shape, so they're taken in the order the
+	 * interpreter lists them, x then prev (convert_temporal.py --verify
+	 * checks this). The outputs are told apart by their last dimension.
+	 */
+	inX_ = interpreter_->inputs()[0];
+	inPrev_ = interpreter_->inputs()[1];
+	for (int idx : interpreter_->outputs()) {
+		const TfLiteTensor *t = interpreter_->tensor(idx);
+		const int c = t && t->dims && t->dims->size == 4 ? t->dims->data[3] : 0;
+		if (c == int(kChannels))
+			outR_ = idx;
+		else if (c == 1)
+			outA_ = idx;
+	}
+	if (outR_ < 0 || outA_ < 0) {
+		LOG(RPiDenoiseBstm, Error)
+			<< model_ << ": outputs must be r [1, H, W, 16] and a [1, H, W, 1]";
+		return;
+	}
+
+	const TfLiteTensor *x = interpreter_->tensor(inX_);
+	const TfLiteTensor *prev = interpreter_->tensor(inPrev_);
+	const TfLiteTensor *r = interpreter_->tensor(outR_);
+	const TfLiteTensor *a = interpreter_->tensor(outA_);
+	bool int8[4];
+	if (!checkTensor(x, "input x", kChannels, int8[0], xScale_, xZp_) ||
+	    !checkTensor(prev, "input prev", kChannels, int8[1], prevScale_, prevZp_) ||
+	    !checkTensor(r, "output r", kChannels, int8[2], rScale_, rZp_) ||
+	    !checkTensor(a, "output a", 1, int8[3], aScale_, aZp_))
+		return;
+	if (int8[1] != int8[0] || int8[2] != int8[0] || int8[3] != int8[0]) {
+		LOG(RPiDenoiseBstm, Error)
+			<< model_ << ": inputs and outputs must be all int8 or all float32";
+		return;
+	}
+	isFloat_ = !int8[0];
+
+	netH_ = x->dims->data[1];
+	netW_ = x->dims->data[2];
+	for (const TfLiteTensor *t : { prev, r, a }) {
+		if (unsigned(t->dims->data[1]) != netH_ || unsigned(t->dims->data[2]) != netW_) {
+			LOG(RPiDenoiseBstm, Error)
+				<< model_ << ": all inputs and outputs must be the same size";
+			return;
+		}
+	}
+
+	buildTables();
 
 	LOG(RPiDenoiseBstm, Info)
 		<< "Loaded " << model_ << " (" << kChannels << "x" << netH_ << "x" << netW_
-		<< "), " << delegated << "/" << plan.size() << " nodes on the NPU, BSTM_FLOAT="
-		<< getenv("BSTM_FLOAT");
-	auto describe = [](bool isInt8, float scale, int zp) {
-		std::ostringstream os;
-		if (isInt8)
-			os << "int8 (scale " << scale << ", zero point " << zp << ")";
-		else
-			os << "float32";
-		return os.str();
-	};
-	LOG(RPiDenoiseBstm, Info)
-		<< "Input " << describe(inInt8_, inScale_, inZp_)
-		<< ", output " << describe(outInt8_, outScale_, outZp_);
+		<< "), " << delegated << "/" << plan.size()
+		<< (cpu_ ? " nodes delegated to XNNPACK, all on the CPU (" : " nodes on the NPU")
+		<< (cpu_ ? std::to_string(cpuThreads_) + " threads)" : "");
+	if (isFloat_ && !cpu_)
+		LOG(RPiDenoiseBstm, Info)
+			<< "float32 model, BSTM_FLOAT=" << getenv("BSTM_FLOAT");
+	else if (isFloat_)
+		LOG(RPiDenoiseBstm, Info) << "float32 model";
+	else
+		LOG(RPiDenoiseBstm, Info)
+			<< "int8 model: x (" << xScale_ << ", " << xZp_ << "), prev (" << prevScale_
+			<< ", " << prevZp_ << "), r (" << rScale_ << ", " << rZp_ << "), a (" << aScale_
+			<< ", " << aZp_ << ")";
 
 	init_ = true;
+}
+
+/*
+ * The input tables don't depend on the model except through x's
+ * quantisation; the sigmoid table belongs to a's scale and zero point. All
+ * are computed in double, then rounded once. A float model needs only
+ * xfTable_: its a output isn't limited to 256 values, so the sigmoid is
+ * computed directly.
+ */
+void DenoiseBstm::buildTables()
+{
+	xfTable_.resize(kTableSize);
+	for (unsigned i = 0; i < kTableSize; i++)
+		xfTable_[i] = float(std::sqrt(double(i << kRawShift) / 65535.0));
+
+	if (isFloat_) {
+		xqTable_.clear();
+		alphaTable_.clear();
+		return;
+	}
+
+	xqTable_.resize(kTableSize);
+	for (unsigned i = 0; i < kTableSize; i++) {
+		const double v = std::sqrt(double(i << kRawShift) / 65535.0);
+		xqTable_[i] = int8_t(std::clamp(int(std::lround(v / xScale_)) + xZp_, -128, 127));
+	}
+
+	alphaTable_.resize(256);
+	for (int q = -128; q <= 127; q++)
+		alphaTable_[q + 128] = float(1.0 / (1.0 + std::exp(-double(q - aZp_) * aScale_)));
 }
 
 void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Metadata *metadata)
 {
 	width_ = cameraMode.width;
 	height_ = cameraMode.height;
+	active_ = false;
 
 	if (!init_)
 		return;
 
 	/*
-	 * Same geometry as denoise_ncnn.cpp: the 4 Bayer planes are half the
-	 * raw size normally, or a quarter when downscale_ (2x2 averaged), and
-	 * space_to_depth(2) halves those again. The model's input size is
-	 * fixed, so anything smaller is zero-padded and anything larger is
-	 * cropped (and left untouched).
+	 * One network pixel per 4x4 raw block. The model's size is fixed, so
+	 * a smaller frame is padded (with the inputs' encoding of zero) and a
+	 * larger one cropped, the rest being left untouched.
 	 */
-	const unsigned bayerDiv = downscale_ ? 4 : 2;
-	unsigned packW = width_ / bayerDiv / 2;
-	unsigned packH = height_ / bayerDiv / 2;
-
+	unsigned packW = width_ / 4;
+	unsigned packH = height_ / 4;
 	if (packW > netW_ || packH > netH_) {
 		LOG(RPiDenoiseBstm, Error)
 			<< "Bayer " << width_ << "x" << height_ << " (network " << packW << "x" << packH
@@ -313,27 +479,32 @@ void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 	}
 	packW_ = packW;
 	packH_ = packH;
-	bayerW_ = packW_ * 2;
-	bayerH_ = packH_ * 2;
-	validW_ = downscale_ ? bayerW_ * 2 : bayerW_;
-	validH_ = downscale_ ? bayerH_ * 2 : bayerH_;
+	if (!packW_ || !packH_)
+		return;
 
-	if (downscale_) {
-		bayerBuffer_.assign(size_t(4) * bayerW_ * bayerH_, 0.0f);
-		upscaleBuffer_.assign(size_t(4) * validW_ * validH_, 0.0f);
-	} else {
-		bayerBuffer_.clear();
-		upscaleBuffer_.clear();
-	}
-	if (downscale_ && (inInt8_ || outInt8_))
-		scratch_.assign(size_t(netW_) * netH_ * kChannels, 0.0f);
+	if (isFloat_)
+		prev_.clear();
 	else
-		scratch_.clear();
+		prev_.assign(size_t(packW_) * packH_ * kChannels, 0);
+
+	/*
+	 * TFLite never writes its input tensors, so whatever lies outside the
+	 * packed region stays as filled here for as long as this mode lasts.
+	 */
+	const size_t n = size_t(netW_) * netH_ * kChannels;
+	TfLiteTensor *x = interpreter_->tensor(inX_);
+	if (isFloat_)
+		std::fill(x->data.f, x->data.f + n, 0.0f);
+	else
+		std::fill(x->data.int8, x->data.int8 + n, int8_t(xZp_));
+
+	dumpCount_ = 0;
+	active_ = true;
+	reset();
 
 	LOG(RPiDenoiseBstm, Info)
-		<< "Bayer " << width_ << "x" << height_
-		<< " -> " << kChannels << "x" << netH_ << "x" << netW_
-		<< " (pack " << packW_ << "x" << packH_ << ", valid " << validW_ << "x" << validH_ << ")";
+		<< "Bayer " << width_ << "x" << height_ << " -> " << kChannels << "x" << netH_
+		<< "x" << netW_ << " (pack " << packW_ << "x" << packH_ << ")";
 }
 
 void DenoiseBstm::setMode([[maybe_unused]] DenoiseMode mode)
@@ -341,465 +512,305 @@ void DenoiseBstm::setMode([[maybe_unused]] DenoiseMode mode)
 }
 
 /*
- * Fill the network pixels beyond packW_ x packH_ with the encoding of 0.0
- * (0.0f, or an int8 input tensor's zero point), so the network sees black
- * rather than stale data there.
+ * Restart from frame 0: the network's prev input becomes real zeros (for
+ * int8, its zero point, -128, not int8 0), and the next blend ignores alpha.
  */
-template<typename T>
-void DenoiseBstm::zeroBorder(T *in, T zero)
+void DenoiseBstm::reset()
 {
-	const size_t rowLen = size_t(netW_) * kChannels;
-
-	if (packW_ < netW_) {
-		for (unsigned y = 0; y < packH_; ++y)
-			std::fill(in + y * rowLen + size_t(packW_) * kChannels, in + (y + 1) * rowLen, zero);
-	}
-	std::fill(in + packH_ * rowLen, in + netH_ * rowLen, zero);
-}
-
-void DenoiseBstm::packBayer(const uint16_t *bayer16, unsigned stridePx, float *in)
-{
-	if (downscale_)
-		packBayerDownscale(bayer16, stridePx, in);
+	const size_t n = size_t(netW_) * netH_ * kChannels;
+	TfLiteTensor *prev = interpreter_->tensor(inPrev_);
+	if (isFloat_)
+		std::fill(prev->data.f, prev->data.f + n, 0.0f);
 	else
-		packBayerFull(bayer16, stridePx, in);
+		std::fill(prev->data.int8, prev->data.int8 + n, int8_t(prevZp_));
+
+	firstFrame_ = true;
+	lastExposure_ = 0.0;
 }
 
 /*
- * Pack the raw Bayer frame into the network's NHWC input: network pixel
- * (x,y) covers raw rows [4y,4y+4) and columns [4x,4x+4), raw offset
- * (dx,dy) going to channel rawToChannel(dx,dy). Each sample is raw / 65535
- * for a float tensor, or quantised as TFLite would for an int8 one:
- * round(raw / 65535 / scale) (half away from zero) + zero point, saturated.
+ * Restart on a large jump in exposure time x analogue gain, which the
+ * network was never trained across. Returns true if we reset.
+ */
+bool DenoiseBstm::checkContinuity(Metadata *imageMetadata)
+{
+	DeviceStatus deviceStatus;
+	if (imageMetadata->get("device.status", deviceStatus) != 0)
+		return false;
+
+	const double exposure = deviceStatus.exposureTime.get<std::micro>() * deviceStatus.analogueGain;
+	if (!(exposure > 0.0))
+		return false;
+
+	bool jump = false;
+	if (lastExposure_ > 0.0) {
+		const double ratio = exposure / lastExposure_;
+		jump = ratio > resetRatio_ || ratio < 1.0 / resetRatio_;
+	}
+	if (jump) {
+		LOG(RPiDenoiseBstm, Debug)
+			<< "Exposure x gain jumped from " << lastExposure_ << " to " << exposure
+			<< " -- restarting";
+		reset();
+	}
+	lastExposure_ = exposure;
+
+	return jump;
+}
+
+/*
+ * Pack the raw Bayer frame into the network's x input: network pixel (x,y)
+ * covers raw rows [4y,4y+4) and columns [4x,4x+4), raw offset (dx,dy) going
+ * to channel rawToChannel(dx,dy), each sample being its square root from
+ * table: quantised (xqTable_) for an int8 model, or in float (xfTable_).
+ *
+ * The 16 scalar table lookups per network pixel make this compute-bound
+ * rather than memory-bound, so it is threaded (2.1 ms -> 1.4 ms with 2
+ * threads on a Pi 5).
  */
 template<typename T>
-void DenoiseBstm::packBayerFull(const uint16_t *bayer16, unsigned stridePx, T *in)
+void DenoiseBstm::packInput(const uint16_t *bayer16, unsigned stridePx, const T *table,
+				    T *in)
 {
-	constexpr bool isInt8 = std::is_same_v<T, int8_t>;
 	const unsigned netW = netW_, packW = packW_, packH = packH_;
-	const float k = isInt8 ? 1.0f / (65535.0f * inScale_) : 1.0f / 65535.0f;
-	const int zp = inZp_;
-	auto encode = [&](uint16_t raw) -> T {
-		const float v = float(raw) * k;
-		if constexpr (isInt8)
-			return int8_t(std::clamp(int(std::lround(v)) + zp, -128, 127));
-		else
-			return v;
-	};
 
-#if defined(__ARM_NEON)
-	const float32x4_t vK = vdupq_n_f32(k);
-	const int32x4_t vZp = vdupq_n_s32(zp);
-	auto toFloat = [&](uint16x4_t v) { return vmulq_f32(vcvtq_f32_u32(vmovl_u16(v)), vK); };
-	[[maybe_unused]] auto toInt8x4 = [&](float32x4_t v) {
-		return vqmovn_s32(vqaddq_s32(vcvtaq_s32_f32(v), vZp));
-	};
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads_) schedule(static)
 #endif
-
-	/*
-	 * Single-threaded, as is depthToRaw(): this is memory-bound, and
-	 * measured slower with more threads.
-	 */
-	for (unsigned y = 0; y < packH; ++y) {
+	for (int y_ = 0; y_ < int(packH); ++y_) {
+		const unsigned y = unsigned(y_);
 		T *d = in + size_t(y) * netW * kChannels;
 		const uint16_t *rows[4];
 		for (unsigned dy = 0; dy < 4; ++dy)
 			rows[dy] = bayer16 + size_t(4 * y + dy) * stridePx;
 
-		unsigned x0 = 0;
-#if defined(__ARM_NEON)
-		/*
-		 * Two network pixels (8 raw samples per row) at a time. Raw row dy
-		 * of a pixel holds, in dx order, channels (see rawToChannel()):
-		 * dy=0: 0,4,1,5   dy=1: 8,12,9,13   dy=2: 2,6,3,7   dy=3: 10,14,11,15
-		 * so unzipping rows 0 and 2 gives channels 0-3 and 4-7, and rows 1
-		 * and 3 give channels 8-11 and 12-15.
-		 */
-		for (; x0 + 2 <= packW; x0 += 2) {
-			uint16x8_t r[4];
-			for (unsigned dy = 0; dy < 4; ++dy)
-				r[dy] = vld1q_u16(rows[dy] + 4 * x0);
-			for (unsigned k2 = 0; k2 < 2; ++k2) {
-				float32x4_t f[4];
-				for (unsigned dy = 0; dy < 4; ++dy)
-					f[dy] = toFloat(k2 ? vget_high_u16(r[dy]) : vget_low_u16(r[dy]));
-				const float32x4x4_t c{ vuzp1q_f32(f[0], f[2]), vuzp2q_f32(f[0], f[2]),
-						       vuzp1q_f32(f[1], f[3]), vuzp2q_f32(f[1], f[3]) };
-				T *p = d + size_t(x0 + k2) * kChannels;
-				if constexpr (isInt8) {
-					const int16x8_t lo = vcombine_s16(toInt8x4(c.val[0]), toInt8x4(c.val[1]));
-					const int16x8_t hi = vcombine_s16(toInt8x4(c.val[2]), toInt8x4(c.val[3]));
-					vst1q_s8(p, vcombine_s8(vqmovn_s16(lo), vqmovn_s16(hi)));
-				} else {
-					vst1q_f32_x4(p, c);
-				}
-			}
-		}
-#endif
-		for (unsigned dy = 0; dy < 4; ++dy) {
-			const uint16_t *row = rows[dy];
-			for (unsigned x = x0; x < packW; ++x) {
-				T *p = d + size_t(x) * kChannels;
-				const uint16_t *r = row + 4 * x;
+		for (unsigned x = 0; x < packW; ++x) {
+			T *p = d + size_t(x) * kChannels;
+			for (unsigned dy = 0; dy < 4; ++dy) {
+				const uint16_t *r = rows[dy] + 4 * x;
 				for (unsigned dx = 0; dx < 4; ++dx)
-					p[rawToChannel(dx, dy)] = encode(r[dx]);
+					p[rawToChannel(dx, dy)] = table[r[dx] >> kRawShift];
 			}
 		}
 	}
-
-	zeroBorder(in, isInt8 ? T(zp) : T(0));
 }
 
 /*
- * downscale_ variant: first box-average each Bayer colour over 2x2 (each
- * averaged sample covering a 4x4 raw block), then space_to_depth(2) as
- * usual -- so network pixel (x,y) covers raw rows [8y,8y+8) and columns
- * [8x,8x+8). Channel c*4 + i*2 + j holds colour c averaged over the 4x4
- * raw block at raw rows [8y+4i,8y+4i+4) and columns [8x+4j,8x+4j+4); e.g.
- * R at block-relative (0,0),(2,0),(0,2),(2,2).
+ * Complete the frame from the network's outputs, all in float and in
+ * square-root space, for each network pixel and channel k:
+ *
+ *   s    = clamp(xf + r, 0, 1)
+ *   out  = s                                   on the first frame
+ *   out  = prev + alpha * (s - prev)           otherwise
+ *
+ * with xf the current frame's square root (looked up again from the raw
+ * values, which are still in the buffer), and alpha = sigmoid(a), one per
+ * network pixel. out is kept for the next frame, and written back over the
+ * raw buffer squared, as round(out^2 * 65535).
+ *
+ * int8 model: r and a are dequantised, (q - zero point) * scale, and alpha
+ * comes from alphaTable_. out is kept in prev_ (as 16-bit fixed point,
+ * round(out * 65535)), and written quantised to the network's prev input
+ * ready for the next frame.
  */
-void DenoiseBstm::packBayerDownscale(const uint16_t *bayer16, unsigned stridePx, float *in)
+void DenoiseBstm::blendInt8(uint16_t *bayer16, unsigned stridePx)
 {
 	const unsigned netW = netW_, packW = packW_, packH = packH_;
-	constexpr float invMax4 = 1.0f / (65535.0f * 4.0f);
+	/* demo_: write back the right half only (but update everything else). */
+	const unsigned xStart = demo_ ? packW / 2 : 0;
+	const bool first = firstFrame_;
+	const float *xfTable = xfTable_.data();
+	const float *alphaTable = alphaTable_.data();
+	const int8_t *rOut = interpreter_->tensor(outR_)->data.int8;
+	const int8_t *aOut = interpreter_->tensor(outA_)->data.int8;
+	int8_t *prevIn = interpreter_->tensor(inPrev_)->data.int8;
+	uint16_t *prevBuf = prev_.data();
+	const float rScale = rScale_;
+	const int rZp = rZp_;
+	const float prevInvScale = 1.0f / prevScale_;
+	const int prevZp = prevZp_;
+
+#if defined(__ARM_NEON)
+	const float32x4_t vRScale = vdupq_n_f32(rScale);
+	const int16x8_t vRZp = vdupq_n_s16(int16_t(rZp));
+	const float32x4_t vZero = vdupq_n_f32(0.0f);
+	const float32x4_t vOne = vdupq_n_f32(1.0f);
+	const float32x4_t vPrevInvScale = vdupq_n_f32(prevInvScale);
+	const int32x4_t vPrevZp = vdupq_n_s32(prevZp);
+	const float32x4_t vRawMax = vdupq_n_f32(65535.0f);
+	const float32x4_t vInvMax = vdupq_n_f32(1.0f / 65535.0f);
+#endif
 
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(threads_) schedule(static)
 #endif
 	for (int y_ = 0; y_ < int(packH); ++y_) {
 		const unsigned y = unsigned(y_);
-		float *d = in + size_t(y) * netW * kChannels;
-		for (unsigned i = 0; i < 2; ++i) {
-			const uint16_t *rows[4];
-			for (unsigned r = 0; r < 4; ++r)
-				rows[r] = bayer16 + size_t(8 * y + 4 * i + r) * stridePx;
-			for (unsigned x = 0; x < packW; ++x) {
-				float *p = d + size_t(x) * kChannels;
-				for (unsigned j = 0; j < 2; ++j) {
-					const unsigned col = 8 * x + 4 * j;
-					for (unsigned c = 0; c < 4; ++c) {
-						const unsigned cx = col + (c & 1), cy = c >> 1;
-						float sum = float(rows[cy][cx]) + rows[cy][cx + 2] +
-							    rows[cy + 2][cx] + rows[cy + 2][cx + 2];
-						p[c * 4 + i * 2 + j] = sum * invMax4;
-					}
-				}
-			}
-		}
-	}
-
-	zeroBorder(in, 0.0f);
-}
-
-void DenoiseBstm::unpackBayer(uint16_t *bayer16, unsigned stridePx, const float *out)
-{
-	if (downscale_) {
-		depthToSpace(out);
-		const size_t bayerPlane = size_t(bayerW_) * bayerH_;
-		const size_t plane = size_t(validW_) * validH_;
-		for (unsigned c = 0; c < 4; c++)
-			upscaleChannel2x(bayerBuffer_.data() + c * bayerPlane, bayerW_, bayerW_, bayerH_,
-					 upscaleBuffer_.data() + c * plane, validW_, validH_);
-		interleaveToRaw(bayer16, stridePx, upscaleBuffer_.data() + 0 * plane,
-				upscaleBuffer_.data() + 1 * plane, upscaleBuffer_.data() + 2 * plane,
-				upscaleBuffer_.data() + 3 * plane, validW_);
-		return;
-	}
-
-	depthToRaw(bayer16, stridePx, out);
-}
-
-/* Pack the frame into the model's input tensor, float32 or int8. */
-void DenoiseBstm::packInput(const uint16_t *bayer16, unsigned stridePx)
-{
-	TfLiteTensor *t = interpreter_->input_tensor(0);
-
-	if (!inInt8_)
-		packBayer(bayer16, stridePx, t->data.f);
-	else if (!downscale_)
-		packBayerFull(bayer16, stridePx, t->data.int8);
-	else {
-		/* Not speed-critical: pack as float, then quantise. */
-		packBayerDownscale(bayer16, stridePx, scratch_.data());
-		quantiseInput(scratch_.data(), t->data.int8);
-	}
-}
-
-/* Write the model's output tensor, float32 or int8, back over the frame. */
-void DenoiseBstm::unpackOutput(uint16_t *bayer16, unsigned stridePx)
-{
-	const TfLiteTensor *t = interpreter_->output_tensor(0);
-
-	if (!outInt8_)
-		unpackBayer(bayer16, stridePx, t->data.f);
-	else if (!downscale_)
-		depthToRaw(bayer16, stridePx, static_cast<const int8_t *>(t->data.int8));
-	else {
-		/* Not speed-critical: dequantise, then unpack as float. */
-		dequantiseOutput(t->data.int8, scratch_.data());
-		unpackBayer(bayer16, stridePx, scratch_.data());
-	}
-}
-
-/* float -> int8 input tensor, as in packBayerFull(). */
-void DenoiseBstm::quantiseInput(const float *v, int8_t *q)
-{
-	const size_t n = size_t(netW_) * netH_ * kChannels;
-	const float k = 1.0f / inScale_;
-
-	for (size_t i = 0; i < n; ++i)
-		q[i] = int8_t(std::clamp(int(std::lround(v[i] * k)) + inZp_, -128, 127));
-}
-
-/* int8 output tensor -> float: (q - zero point) * scale. */
-void DenoiseBstm::dequantiseOutput(const int8_t *q, float *v)
-{
-	const size_t n = size_t(netW_) * netH_ * kChannels;
-
-	for (size_t i = 0; i < n; ++i)
-		v[i] = float(int(q[i]) - outZp_) * outScale_;
-}
-
-/*
- * Inverse of packBayer(): write each network output pixel's 16 channels
- * straight back over its 4x4 raw block. A float output v is written as
- * v * 65535; an int8 output q is dequantised first, (q - zero point) *
- * scale, with the scale folded into the same fused multiply-add.
- */
-template<typename T>
-void DenoiseBstm::depthToRaw(uint16_t *bayer16, unsigned stridePx, const T *out)
-{
-	constexpr bool isInt8 = std::is_same_v<T, int8_t>;
-	const unsigned netW = netW_, packW = packW_, packH = packH_;
-	/* demo_: write back the right half only. */
-	const unsigned xStart = demo_ ? packW / 2 : 0;
-	const float scaleMax = isInt8 ? outScale_ * 65535.0f : 65535.0f;
-	const int zp = outZp_;
-	auto decode = [&](T q) -> float {
-		if constexpr (isInt8)
-			return float(int(q) - zp);
-		else
-			return q;
-	};
-
-#if defined(__ARM_NEON)
-	const float32x4_t vScaleMax = vdupq_n_f32(scaleMax);
-	const int16x8_t vZp = vdupq_n_s16(int16_t(zp));
-	/* One network pixel's 16 channels as float32x4 x 4 (channels 0-3 ... 12-15). */
-	auto loadPixel = [&](const T *p) -> float32x4x4_t {
-		if constexpr (isInt8) {
-			const int8x16_t q = vld1q_s8(p);
-			/* q - zp is within [-255, 255]: exact in int16. */
-			const int16x8_t lo = vsubq_s16(vmovl_s8(vget_low_s8(q)), vZp);
-			const int16x8_t hi = vsubq_s16(vmovl_s8(vget_high_s8(q)), vZp);
-			auto cvt = [](int16x4_t v) { return vcvtq_f32_s32(vmovl_s16(v)); };
-			return { cvt(vget_low_s16(lo)), cvt(vget_high_s16(lo)),
-				 cvt(vget_low_s16(hi)), cvt(vget_high_s16(hi)) };
-		} else {
-			return vld1q_f32_x4(p);
-		}
-	};
-	/*
-	 * One network pixel's 16 channels, loaded as 4 registers (channels
-	 * 0-3, 4-7, 8-11, 12-15), hold raw row dy's 4 samples, in dx order, as:
-	 * dy=0: zip1(c0-3, c4-7) = 0,4,1,5    dy=1: zip1(c8-11, c12-15) = 8,12,9,13
-	 * dy=2: zip2(c0-3, c4-7) = 2,6,3,7    dy=3: zip2(c8-11, c12-15) = 10,14,11,15
-	 * (see rawToChannel()).
-	 */
-	auto rowSamples = [](const float32x4x4_t &v, unsigned dy) {
-		return dy == 0	 ? vzip1q_f32(v.val[0], v.val[1])
-		       : dy == 1 ? vzip1q_f32(v.val[2], v.val[3])
-		       : dy == 2 ? vzip2q_f32(v.val[0], v.val[1])
-				 : vzip2q_f32(v.val[2], v.val[3]);
-	};
-	const float32x4_t vZero = vdupq_n_f32(0.0f);
-#endif
-	const bool residual = residual_;
-
-	/*
-	 * Single-threaded, as is packBayer(): this is memory-bound, and
-	 * measured slower with more threads.
-	 */
-	for (unsigned y = 0; y < packH; ++y) {
-		const T *s = out + size_t(y) * netW * kChannels;
+		const int8_t *rRow = rOut + size_t(y) * netW * kChannels;
+		const int8_t *aRow = aOut + size_t(y) * netW;
+		int8_t *pqRow = prevIn + size_t(y) * netW * kChannels;
+		uint16_t *pRow = prevBuf + size_t(y) * packW * kChannels;
 		uint16_t *rows[4];
 		for (unsigned dy = 0; dy < 4; ++dy)
 			rows[dy] = bayer16 + size_t(4 * y + dy) * stridePx;
 
-		unsigned x0 = xStart;
+		for (unsigned x = 0; x < packW; ++x) {
+			alignas(16) float xf[kChannels];
+			gatherSqrt(rows, x, xfTable, xf);
+			const float alpha = alphaTable[aRow[x] + 128];
+			uint16_t *p = pRow + size_t(x) * kChannels;
+			int8_t *pq = pqRow + size_t(x) * kChannels;
+
 #if defined(__ARM_NEON)
-		/* Two network pixels (8 raw samples per row) at a time. */
-		for (; x0 + 2 <= packW; x0 += 2) {
-			const T *p = s + size_t(x0) * kChannels;
-			const float32x4x4_t a = loadPixel(p);
-			const float32x4x4_t b = loadPixel(p + kChannels);
-			for (unsigned dy = 0; dy < 4; ++dy) {
-				uint16_t *r = rows[dy] + 4 * x0;
-				float32x4_t baseA = vZero, baseB = vZero;
-				if (residual) {
-					/* Still the network's input: we write in place. */
-					const uint16x8_t in = vld1q_u16(r);
-					baseA = rawToFloat4(vget_low_u16(in));
-					baseB = rawToFloat4(vget_high_u16(in));
-				}
-				vst1q_u16(r, vcombine_u16(toRaw4(rowSamples(a, dy), baseA, vScaleMax),
-							  toRaw4(rowSamples(b, dy), baseB, vScaleMax)));
+			/* r - zr is within [-255, 255]: exact in int16. */
+			const int8x16_t rq = vld1q_s8(rRow + size_t(x) * kChannels);
+			const int16x8_t rLo = vsubq_s16(vmovl_s8(vget_low_s8(rq)), vRZp);
+			const int16x8_t rHi = vsubq_s16(vmovl_s8(vget_high_s8(rq)), vRZp);
+			auto cvt = [](int16x4_t v) { return vcvtq_f32_s32(vmovl_s16(v)); };
+			const float32x4_t rf[4] = { cvt(vget_low_s16(rLo)), cvt(vget_high_s16(rLo)),
+						    cvt(vget_low_s16(rHi)), cvt(vget_high_s16(rHi)) };
+			const float32x4x4_t xv = vld1q_f32_x4(xf);
+			float32x4x4_t pv;
+			if (!first) {
+				const uint16x8x2_t pu = vld1q_u16_x2(p);
+				auto cvtPrev = [&](uint16x4_t v) {
+					return vmulq_f32(vcvtq_f32_u32(vmovl_u16(v)), vInvMax);
+				};
+				pv = { cvtPrev(vget_low_u16(pu.val[0])), cvtPrev(vget_high_u16(pu.val[0])),
+				       cvtPrev(vget_low_u16(pu.val[1])), cvtPrev(vget_high_u16(pu.val[1])) };
 			}
-		}
+			const float32x4_t vAlpha = vdupq_n_f32(alpha);
+
+			float32x4x4_t out;
+			for (unsigned i = 0; i < 4; ++i) {
+				/* The residual's dequantising multiply is fused with the skip add. */
+				float32x4_t s = vfmaq_f32(xv.val[i], rf[i], vRScale);
+				s = vminq_f32(vmaxq_f32(s, vZero), vOne);
+				out.val[i] = first ? s
+						   : vfmaq_f32(pv.val[i], vAlpha, vsubq_f32(s, pv.val[i]));
+			}
+			/* Kept to 16 bits: out is in [0, 1], so no clamp is needed (see writeRaw()). */
+			uint16x4_t pu[4];
+			for (unsigned i = 0; i < 4; ++i)
+				pu[i] = vqmovn_u32(vcvtaq_u32_f32(vmulq_f32(out.val[i], vRawMax)));
+			vst1q_u16_x2(p, uint16x8x2_t{ vcombine_u16(pu[0], pu[1]), vcombine_u16(pu[2], pu[3]) });
+
+			/*
+			 * The next frame's prev input, quantised as TFLite would:
+			 * round half away from zero (FCVTAS), plus the zero point,
+			 * saturated to int8.
+			 */
+			int16x4_t q16[4];
+			for (unsigned i = 0; i < 4; ++i)
+				q16[i] = vqmovn_s32(vqaddq_s32(vcvtaq_s32_f32(vmulq_f32(out.val[i], vPrevInvScale)),
+							       vPrevZp));
+			vst1q_s8(pq, vcombine_s8(vqmovn_s16(vcombine_s16(q16[0], q16[1])),
+						 vqmovn_s16(vcombine_s16(q16[2], q16[3]))));
+#else
+			const int8_t *rq = rRow + size_t(x) * kChannels;
+			float out[kChannels];
+			for (unsigned k = 0; k < kChannels; ++k) {
+				float s = std::fma(float(int(rq[k]) - rZp), rScale, xf[k]);
+				s = std::clamp(s, 0.0f, 1.0f);
+				const float pk = float(p[k]) * (1.0f / 65535.0f);
+				out[k] = first ? s : std::fma(alpha, s - pk, pk);
+				p[k] = uint16_t(std::lround(out[k] * 65535.0f));
+				pq[k] = int8_t(std::clamp(int(std::lround(out[k] * prevInvScale)) + prevZp,
+							  -128, 127));
+			}
 #endif
-		for (unsigned dy = 0; dy < 4; ++dy) {
-			uint16_t *row = rows[dy];
-			for (unsigned x = x0; x < packW; ++x) {
-				const T *p = s + size_t(x) * kChannels;
-				uint16_t *r = row + 4 * x;
-				for (unsigned dx = 0; dx < 4; ++dx)
-					r[dx] = quantise(decode(p[rawToChannel(dx, dy)]),
-							 residual ? float(r[dx]) : 0.0f, scaleMax);
-			}
+
+			if (x >= xStart)
+				writeRaw(rows, x, out);
 		}
 	}
 }
 
 /*
- * downscale_ only: depth_to_space(2) the network's NHWC output back into
- * 4 quarter-res Bayer planes (bayerBuffer_, bayerW_ x bayerH_ each), ready
- * for upscaleChannel2x().
+ * As blendInt8(), for a float model: r and a need no dequantising, alpha is
+ * computed directly (one exp per network pixel), and out is kept in the
+ * network's float prev input itself, which is read back next frame. TFLite
+ * never writes its inputs, and the Teflon delegate converts them to
+ * bf16/fp16 without touching the originals.
  */
-void DenoiseBstm::depthToSpace(const float *out)
+void DenoiseBstm::blendFloat(uint16_t *bayer16, unsigned stridePx)
 {
-	const unsigned netW = netW_, packW = packW_, packH = packH_, bayerW = bayerW_;
-	const size_t bayerPlane = size_t(bayerW_) * bayerH_;
-	float *const dst = bayerBuffer_.data();
+	const unsigned netW = netW_, packW = packW_, packH = packH_;
+	/* demo_: write back the right half only (but update everything else). */
+	const unsigned xStart = demo_ ? packW / 2 : 0;
+	const bool first = firstFrame_;
+	const float *xfTable = xfTable_.data();
+	const float *rOut = interpreter_->tensor(outR_)->data.f;
+	const float *aOut = interpreter_->tensor(outA_)->data.f;
+	float *prevIn = interpreter_->tensor(inPrev_)->data.f;
+
+#if defined(__ARM_NEON)
+	const float32x4_t vZero = vdupq_n_f32(0.0f);
+	const float32x4_t vOne = vdupq_n_f32(1.0f);
+#endif
 
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(threads_) schedule(static)
 #endif
 	for (int y_ = 0; y_ < int(packH); ++y_) {
 		const unsigned y = unsigned(y_);
-		const float *s = out + size_t(y) * netW * kChannels;
+		const float *rRow = rOut + size_t(y) * netW * kChannels;
+		const float *aRow = aOut + size_t(y) * netW;
+		float *pRow = prevIn + size_t(y) * netW * kChannels;
+		uint16_t *rows[4];
+		for (unsigned dy = 0; dy < 4; ++dy)
+			rows[dy] = bayer16 + size_t(4 * y + dy) * stridePx;
+
 		for (unsigned x = 0; x < packW; ++x) {
-			const float *p = s + size_t(x) * kChannels;
-			for (unsigned c = 0; c < 4; ++c)
-				for (unsigned i = 0; i < 2; ++i) {
-					float *d = dst + c * bayerPlane + size_t(2 * y + i) * bayerW + 2 * x;
-					d[0] = p[c * 4 + i * 2];
-					d[1] = p[c * 4 + i * 2 + 1];
-				}
-		}
-	}
-}
-
-void DenoiseBstm::interleaveToRaw(uint16_t *bayer16, unsigned stridePx, const float *R,
-				  const float *G1, const float *G2, const float *B,
-				  unsigned srcStride)
-{
-	const unsigned validW = validW_, validH = validH_;
-
-	const bool residual = residual_;
+			alignas(16) float xf[kChannels];
+			gatherSqrt(rows, x, xfTable, xf);
+			const float alpha = 1.0f / (1.0f + std::exp(-aRow[x]));
+			const float *r = rRow + size_t(x) * kChannels;
+			float *p = pRow + size_t(x) * kChannels;
 
 #if defined(__ARM_NEON)
-	const float32x4_t vScaleMax = vdupq_n_f32(65535.0f);
-	const float32x4_t vZero = vdupq_n_f32(0.0f);
-#endif
+			const float32x4x4_t xv = vld1q_f32_x4(xf);
+			const float32x4x4_t rv = vld1q_f32_x4(r);
+			float32x4x4_t pv;
+			if (!first)
+				pv = vld1q_f32_x4(p);
+			const float32x4_t vAlpha = vdupq_n_f32(alpha);
 
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(threads_) schedule(static)
-#endif
-	for (int y_ = 0; y_ < int(validH); ++y_) {
-		const unsigned y = unsigned(y_);
-		uint16_t *row0 = bayer16 + size_t(2 * y) * stridePx;
-		uint16_t *row1 = row0 + stridePx;
-		const float *s0 = R + size_t(y) * srcStride;
-		const float *s1 = G1 + size_t(y) * srcStride;
-		const float *s2 = G2 + size_t(y) * srcStride;
-		const float *s3 = B + size_t(y) * srcStride;
-
-		/* demo_: write back the right half only. */
-		unsigned x = demo_ ? validW / 2 : 0;
-#if defined(__ARM_NEON)
-		for (; x + 4 <= validW; x += 4) {
-			float32x4_t b0 = vZero, b1 = vZero, b2 = vZero, b3 = vZero;
-			if (residual) {
-				/* Still the network's input: we write in place. */
-				const uint16x4x2_t in0 = vld2_u16(row0 + size_t(x) * 2);
-				const uint16x4x2_t in1 = vld2_u16(row1 + size_t(x) * 2);
-				b0 = rawToFloat4(in0.val[0]);
-				b1 = rawToFloat4(in0.val[1]);
-				b2 = rawToFloat4(in1.val[0]);
-				b3 = rawToFloat4(in1.val[1]);
+			float32x4x4_t out;
+			for (unsigned i = 0; i < 4; ++i) {
+				float32x4_t s = vaddq_f32(xv.val[i], rv.val[i]);
+				s = vminq_f32(vmaxq_f32(s, vZero), vOne);
+				out.val[i] = first ? s
+						   : vfmaq_f32(pv.val[i], vAlpha, vsubq_f32(s, pv.val[i]));
 			}
-			const uint16x4x2_t a{ toRaw4(vld1q_f32(s0 + x), b0, vScaleMax),
-					      toRaw4(vld1q_f32(s1 + x), b1, vScaleMax) };
-			const uint16x4x2_t b{ toRaw4(vld1q_f32(s2 + x), b2, vScaleMax),
-					      toRaw4(vld1q_f32(s3 + x), b3, vScaleMax) };
-			vst2_u16(row0 + size_t(x) * 2, a);
-			vst2_u16(row1 + size_t(x) * 2, b);
-		}
+			vst1q_f32_x4(p, out);
+#else
+			float out[kChannels];
+			for (unsigned k = 0; k < kChannels; ++k) {
+				const float s = std::clamp(xf[k] + r[k], 0.0f, 1.0f);
+				out[k] = first ? s : std::fma(alpha, s - p[k], p[k]);
+				p[k] = out[k];
+			}
 #endif
-		for (; x < validW; ++x) {
-			uint16_t *r0 = row0 + 2 * x, *r1 = row1 + 2 * x;
-			r0[0] = quantise(s0[x], residual ? float(r0[0]) : 0.0f);
-			r0[1] = quantise(s1[x], residual ? float(r0[1]) : 0.0f);
-			r1[0] = quantise(s2[x], residual ? float(r1[0]) : 0.0f);
-			r1[1] = quantise(s3[x], residual ? float(r1[1]) : 0.0f);
+
+			if (x >= xStart)
+				writeRaw(rows, x, out);
 		}
 	}
 }
 
-/*
- * Exact 2x bilinear upscale of one srcW x srcH plane (stride srcStride)
- * into a dstStride x dstH plane (dstStride == srcW*2, dstH == srcH*2):
- * original samples land unchanged on even,even destination pixels;
- * odd,even are the average of horizontal neighbours; even,odd the average
- * of vertical neighbours; odd,odd the average of all 4 diagonal
- * neighbours -- which falls out of first horizontally interpolating each
- * source row, then averaging vertically-adjacent interpolated rows.
- * Edge columns/rows clamp to the last valid sample (no wraparound).
- */
-void DenoiseBstm::upscaleChannel2x(const float *src, unsigned srcStride, unsigned srcW,
-				   unsigned srcH, float *dst, unsigned dstStride, unsigned dstH)
+/* Debug only: see dumpDir_. */
+void DenoiseBstm::dumpFrame(const uint16_t *bayer16, unsigned stridePx, const char *what)
 {
-	auto hInterpRow = [](const float *srcRow, unsigned w, float *dstRow) {
-		unsigned j = 0;
-#if defined(__ARM_NEON)
-		/* +5, not +4: keeps the one-element lookahead load (v1's
-		 * last lane, index j+4) inside [0, w-1]. */
-		for (; j + 5 <= w; j += 4) {
-			float32x4_t v0 = vld1q_f32(srcRow + j);
-			float32x4_t v1 = vld1q_f32(srcRow + j + 1);
-			float32x4_t avg = vmulq_n_f32(vaddq_f32(v0, v1), 0.5f);
-			float32x4x2_t inter{ v0, avg };
-			vst2q_f32(dstRow + 2 * j, inter);
-		}
-#endif
-		for (; j < w; j++) {
-			float v0 = srcRow[j], v1 = srcRow[std::min(j + 1, w - 1)];
-			dstRow[2 * j] = v0;
-			dstRow[2 * j + 1] = 0.5f * (v0 + v1);
-		}
-	};
-
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(threads_) schedule(static)
-#endif
-	for (int sy_ = 0; sy_ < int(srcH); ++sy_) {
-		const unsigned sy = unsigned(sy_);
-		/* Reused across rows/frames within each OpenMP worker thread,
-		 * rather than a fresh heap allocation per row. */
-		thread_local std::vector<float> nextRow;
-		nextRow.resize(dstStride);
-		float *evenRow = dst + size_t(2 * sy) * dstStride;
-
-		hInterpRow(src + size_t(sy) * srcStride, srcW, evenRow);
-
-		if (2 * sy + 1 < dstH) {
-			const unsigned sy1 = std::min(sy + 1, srcH - 1);
-			hInterpRow(src + size_t(sy1) * srcStride, srcW, nextRow.data());
-			float *oddRow = evenRow + dstStride;
-			for (unsigned j = 0; j < dstStride; j++)
-				oddRow[j] = 0.5f * (evenRow[j] + nextRow[j]);
-		}
-	}
+	std::ostringstream name;
+	name << dumpDir_ << "/" << what << "_" << std::setw(4) << std::setfill('0') << dumpCount_
+	     << ".raw";
+	std::ofstream f(name.str(), std::ios::binary);
+	for (unsigned y = 0; y < height_; ++y)
+		f.write(reinterpret_cast<const char *>(bayer16 + size_t(y) * stridePx),
+			width_ * sizeof(uint16_t));
+	if (!f)
+		LOG(RPiDenoiseBstm, Error) << "Failed to write " << name.str();
 }
 
 void DenoiseBstm::prepare(Metadata *imageMetadata)
@@ -807,17 +818,12 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 	std::pair<SharedFD, std::span<uint8_t>> bayer;
 	imageMetadata->get("global.bayer_buffer", bayer);
 
-	if (!init_ || !bayer.second.data() || !width_ || !height_)
+	if (!active_ || !bayer.second.data() || !width_ || !height_)
 		return;
 
-	dmabufSyncStart(bayer.first);
-
-	uint16_t *bayer16 = reinterpret_cast<uint16_t *>(bayer.second.data());
-	const unsigned stridePx = (bayer.second.size() / height_) / sizeof(uint16_t);
-
 	/*
-	 * Accept row padding but reject a compressed buffer -- same test
-	 * model_denoise.cpp uses: bytes-per-row >= width, not an exact size.
+	 * Accept row padding but reject a compressed buffer: bytes-per-row
+	 * >= width, not an exact size.
 	 */
 	const size_t rowBytes = bayer.second.size() / height_;
 	const size_t minRow = size_t(width_) * sizeof(uint16_t);
@@ -830,36 +836,79 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 				<< " B/row, need >= " << minRow << " for " << width_
 				<< " px wide. Compressed raw? Skipping denoise_bstm.";
 		}
-		dmabufSyncEnd(bayer.first);
 		return;
 	}
 
-	packInput(bayer16, stridePx);
+	checkContinuity(imageMetadata);
 
+	const Clock::time_point tStart = Clock::now();
+	dmabufSyncStart(bayer.first);
+	const double syncStartMs = msSince(tStart);
+
+	uint16_t *bayer16 = reinterpret_cast<uint16_t *>(bayer.second.data());
+	const unsigned stridePx = rowBytes / sizeof(uint16_t);
+	const bool dump = !dumpDir_.empty() && dumpCount_ < dumpFrames_;
+
+	if (dump) {
+		dumpFrame(bayer16, stridePx, "in");
+		std::ofstream(dumpDir_ + "/frames.txt", dumpCount_ ? std::ios::app : std::ios::trunc)
+			<< dumpCount_ << " " << (firstFrame_ ? 1 : 0) << "\n";
+	}
+
+	const Clock::time_point t0 = Clock::now();
+	if (isFloat_)
+		packInput(bayer16, stridePx, xfTable_.data(), interpreter_->tensor(inX_)->data.f);
+	else
+		packInput(bayer16, stridePx, xqTable_.data(), interpreter_->tensor(inX_)->data.int8);
+	const double packMs = msSince(t0);
+
+	const Clock::time_point t1 = Clock::now();
 	if (interpreter_->Invoke() != kTfLiteOk) {
 		LOG(RPiDenoiseBstm, Error) << "NPU inference failed";
 		dmabufSyncEnd(bayer.first);
+		reset();
 		return;
 	}
+	const double invokeMs = msSince(t1);
 
-	unpackOutput(bayer16, stridePx);
+	const Clock::time_point t2 = Clock::now();
+	if (isFloat_)
+		blendFloat(bayer16, stridePx);
+	else
+		blendInt8(bayer16, stridePx);
+	const double blendMs = msSince(t2);
+	firstFrame_ = false;
 
-	dmabufSyncEnd(bayer.first);
-
-	if (sdn_disable_)
-		imageMetadata->erase("sdn.status");
-	if (tdn_disable_)
-		imageMetadata->erase("tdn.status");
-	else {
-		TdnStatus tdnStatus{};
-		if (imageMetadata->get("tdn.status", tdnStatus) == 0) {
-			tdnStatus.noiseConstant /= 2;
-			tdnStatus.noiseSlope /= 2;
-			imageMetadata->set("tdn.status", tdnStatus);
-		}
+	if (dump) {
+		dumpFrame(bayer16, stridePx, "out");
+		dumpCount_++;
 	}
-	if (cdn_disable_)
-		imageMetadata->erase("cdn.status");
+
+	const Clock::time_point tEnd = Clock::now();
+	dmabufSyncEnd(bayer.first);
+	const double syncEndMs = msSince(tEnd);
+
+	LOG(RPiDenoiseBstm, Debug)
+		<< "sync " << syncStartMs << " + " << syncEndMs << " ms, pack " << packMs
+		<< " ms, network " << invokeMs << " ms, blend " << blendMs << " ms, total "
+		<< msSince(tStart) << " ms";
+
+	/*
+	 * The classic stages' noise thresholds scale with the noise model's
+	 * constant and slope. CDN's threshold is deviation * slope + constant,
+	 * so scaling the noise model scales the threshold itself.
+	 */
+	scaleStatus<SdnStatus>(imageMetadata, "sdn.status", sdnFactor_, [](SdnStatus &st, double f) {
+		st.noiseConstant *= f;
+		st.noiseSlope *= f;
+	});
+	scaleStatus<TdnStatus>(imageMetadata, "tdn.status", tdnFactor_, [](TdnStatus &st, double f) {
+		st.noiseConstant *= f;
+		st.noiseSlope *= f;
+	});
+	scaleStatus<CdnStatus>(imageMetadata, "cdn.status", cdnFactor_, [](CdnStatus &st, double f) {
+		st.threshold *= f;
+	});
 }
 
 /* Register algorithm with the system. */

@@ -1224,13 +1224,13 @@ PiSPCameraData::platformValidate(RPi::RPiCameraConfiguration *rpiConfig) const
 		}
 
 		/*
-		 * rpi.model_denoise reinterprets global.bayer_buffer as linear uint16
-		 * and writes filtered pixels back into it. That is a SW fixup in
-		 * exactly the sense the 16/14-bit case below means, so the same
-		 * escape hatch applies: a PiSP-compressed buffer would be read as
-		 * garbage and handed to the BE's SetDecompress. The algorithm guards
-		 * against that by skipping itself, which turns denoising off with only
-		 * a single log line to show for it.
+		 * rpi.denoise_bstm reinterprets global.bayer_buffer as linear
+		 * uint16 and writes denoised pixels back into it. That is a SW
+		 * fixup in exactly the sense the 16/14-bit case below means, so the
+		 * same escape hatch applies: a PiSP-compressed buffer would be read
+		 * as garbage and handed to the BE's SetDecompress. The algorithm
+		 * guards against that by skipping itself, which turns denoising off
+		 * with only a single log line to show for it.
 		 *
 		 * Costs ~2.7x the bytes per frame of compression mode 1 (4294400 vs
 		 * 2182400 at 1936x1100) -- a few MB/s on a Pi 5. Without it, every app
@@ -1239,7 +1239,7 @@ PiSPCameraData::platformValidate(RPi::RPiCameraConfiguration *rpiConfig) const
 		 */
 		if (bayer.packing != BayerFormat::Packing::None) {
 			LOG(RPI, Info)
-				<< "Front-end compression disabled: rpi.model_denoise "
+				<< "Front-end compression disabled: rpi.denoise_bstm "
 				<< "requires linear 16-bit Bayer.";
 			bayer.packing = BayerFormat::Packing::None;
 		}
