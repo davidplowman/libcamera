@@ -98,6 +98,8 @@
         },
         {
             "rpi.denoise_bstm": {
+                "slow-model": "/home/pi/libcamera/src/ipa/rpi/pisp/data/tflite/imx662_64_2e12_16x274x484_g32-192_c025_d100_int8.tflite",
+                "fast-model": "/home/pi/libcamera/src/ipa/rpi/pisp/data/tflite/imx662_32_2e13w_16x274x484_g32-192_c025_d100_int8.tflite",
                 "model": "/home/pi/libcamera/src/ipa/rpi/pisp/data/tflite/imx662_64_2e12_16x274x484_g32-192_c025_d100_int8.tflite",
                 "float_format": "bf16",
                 "threads": 2,
@@ -105,7 +107,7 @@
                 "cpu_threads": 3,
                 "reset_ratio": 2.0,
                 "demo": true,
-                "sdn_factor": 0.005,
+                "sdn_factor": 0.0,
                 "tdn_factor": 0.0,
                 "cdn_factor": 1.0
             }
