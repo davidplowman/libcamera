@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <type_traits>
+#include <utility>
 
 #include <linux/dma-buf.h>
 
@@ -131,12 +133,14 @@ bool cameraModesMatch(const CameraMode &a, const CameraMode &b)
  * half-resolution grids line up. Each pair of neighbours is cross-faded
  * linearly across the middle of its overlap, over no more than the distance
  * between them, so that no position is ever covered by more than two tiles.
+ * Tile i + 1 is the last to contribute from the start of its cross-fade with
+ * tile i, so that is where its region begins.
  */
 void layoutAxis(unsigned int pack, unsigned int net, unsigned int minOverlap,
 		DenoiseBstm::TileAxis &axis)
 {
 	axis.origin.clear();
-	axis.rampEnd.clear();
+	axis.region.assign(1, 0);
 
 	if (pack <= net) {
 		axis.count = 1;
@@ -172,14 +176,15 @@ void layoutAxis(unsigned int pack, unsigned int net, unsigned int minOverlap,
 		len = std::min(len, end - start);
 		for (; p < start; p++)
 			axis.tile0[p] = i;
+		axis.region.push_back(p);
 		for (unsigned int j = 0; j < len; j++, p++) {
 			axis.tile0[p] = i;
 			axis.weight0[p] = 1.0f - (j + 0.5f) / len;
 		}
-		axis.rampEnd.push_back(p);
 	}
 	for (; p < pack; p++)
 		axis.tile0[p] = axis.count - 1;
+	axis.region.push_back(pack);
 }
 
 /*
@@ -325,41 +330,45 @@ char const *DenoiseBstm::name() const
 
 int DenoiseBstm::read(const libcamera::ValueNode &params)
 {
-	model_ = params["model"].get<std::string>("");
-	delegate_ = params["delegate"].get<std::string>(RPI_TEFLON_PATH);
-	floatFormat_ = params["float_format"].get<std::string>("bf16");
-	sdnFactor_ = params["sdn_factor"].get<double>(0.0);
-	tdnFactor_ = params["tdn_factor"].get<double>(0.0);
-	cdnFactor_ = params["cdn_factor"].get<double>(0.0);
+	return config_.read(params);
+}
 
-	threads_ = params["threads"].get<int>(2);
-	minOverlap_ = params["min_overlap"].get<unsigned int>(4);
-	cpu_ = params["cpu"].get<bool>(false);
-	cpuThreads_ = params["cpu_threads"].get<int>(3);
-	demo_ = params["demo"].get<bool>(false);
-	resetRatio_ = params["reset_ratio"].get<double>(2.0);
+int DenoiseBstm::Config::read(const libcamera::ValueNode &params)
+{
+	model = params["model"].get<std::string>("");
+	delegate = params["delegate"].get<std::string>(RPI_TEFLON_PATH);
+	floatFormat = params["float_format"].get<std::string>("bf16");
+	sdnFactor = params["sdn_factor"].get<double>(0.0);
+	tdnFactor = params["tdn_factor"].get<double>(0.0);
+	cdnFactor = params["cdn_factor"].get<double>(0.0);
 
-	dumpDir_ = params["dump_dir"].get<std::string>("");
-	dumpFrames_ = params["dump_frames"].get<unsigned int>(0);
+	minOverlap = params["min_overlap"].get<unsigned int>(4);
+	cpu = params["cpu"].get<bool>(false);
+	cpuThreads = params["cpu_threads"].get<int>(3);
+	demo = params["demo"].get<bool>(false);
+	resetRatio = params["reset_ratio"].get<double>(2.0);
 
-	if (model_.empty()) {
+	dumpDir = params["dump_dir"].get<std::string>("");
+	dumpFrames = params["dump_frames"].get<unsigned int>(0);
+
+	if (model.empty()) {
 		LOG(RPiDenoiseBstm, Error) << "\"model\" must be supplied";
 		return -EINVAL;
 	}
 
-	if (sdnFactor_ < 0.0 || tdnFactor_ < 0.0 || cdnFactor_ < 0.0) {
+	if (sdnFactor < 0.0 || tdnFactor < 0.0 || cdnFactor < 0.0) {
 		LOG(RPiDenoiseBstm, Error)
 			<< "\"sdn_factor\", \"tdn_factor\" and \"cdn_factor\" must not be negative";
 		return -EINVAL;
 	}
 
-	if (floatFormat_ != "bf16" && floatFormat_ != "fp16") {
+	if (floatFormat != "bf16" && floatFormat != "fp16") {
 		LOG(RPiDenoiseBstm, Error)
-			<< "\"float_format\" must be \"bf16\" or \"fp16\", not \"" << floatFormat_ << "\"";
+			<< "\"float_format\" must be \"bf16\" or \"fp16\", not \"" << floatFormat << "\"";
 		return -EINVAL;
 	}
 
-	if (!(resetRatio_ > 1.0)) {
+	if (!(resetRatio > 1.0)) {
 		LOG(RPiDenoiseBstm, Error) << "\"reset_ratio\" must be greater than 1";
 		return -EINVAL;
 	}
@@ -378,7 +387,7 @@ bool DenoiseBstm::checkTensor(const TfLiteTensor *t, const char *what, int chann
 	if (!t || !t->dims || t->dims->size != 4 || t->dims->data[0] != 1 ||
 	    t->dims->data[3] != channels) {
 		LOG(RPiDenoiseBstm, Error)
-			<< model_ << ": " << what << " must be [1, H, W, " << channels << "]";
+			<< config_.model << ": " << what << " must be [1, H, W, " << channels << "]";
 		return false;
 	}
 
@@ -389,7 +398,7 @@ bool DenoiseBstm::checkTensor(const TfLiteTensor *t, const char *what, int chann
 
 	if (t->type != kTfLiteInt8) {
 		LOG(RPiDenoiseBstm, Error)
-			<< model_ << ": " << what << " must be float32 or int8, not "
+			<< config_.model << ": " << what << " must be float32 or int8, not "
 			<< TfLiteTypeGetName(t->type);
 		return false;
 	}
@@ -398,7 +407,7 @@ bool DenoiseBstm::checkTensor(const TfLiteTensor *t, const char *what, int chann
 	if (t->quantization.type != kTfLiteAffineQuantization || !q || !q->scale ||
 	    q->scale->size != 1 || !(t->params.scale > 0.0f)) {
 		LOG(RPiDenoiseBstm, Error)
-			<< model_ << ": " << what << " must have a single (per-tensor) scale";
+			<< config_.model << ": " << what << " must have a single (per-tensor) scale";
 		return false;
 	}
 
@@ -410,9 +419,9 @@ bool DenoiseBstm::checkTensor(const TfLiteTensor *t, const char *what, int chann
 
 void DenoiseBstm::initialise()
 {
-	flatbuffer_ = tflite::FlatBufferModel::BuildFromFile(model_.c_str());
+	flatbuffer_ = tflite::FlatBufferModel::BuildFromFile(config_.model.c_str());
 	if (!flatbuffer_) {
-		LOG(RPiDenoiseBstm, Error) << "Failed to load TFLite model: " << model_;
+		LOG(RPiDenoiseBstm, Error) << "Failed to load TFLite model: " << config_.model;
 		return;
 	}
 
@@ -426,13 +435,13 @@ void DenoiseBstm::initialise()
 	 * a default delegate would be applied.
 	 */
 	std::unique_ptr<tflite::ops::builtin::BuiltinOpResolver> resolver;
-	if (cpu_)
+	if (config_.cpu)
 		resolver = std::make_unique<tflite::ops::builtin::BuiltinOpResolverWithXNNPACK>();
 	else
 		resolver = std::make_unique<tflite::ops::builtin::BuiltinOpResolver>();
 	tflite::InterpreterBuilder(*flatbuffer_, *resolver)(&interpreter_);
 	if (!interpreter_) {
-		LOG(RPiDenoiseBstm, Error) << "Failed to build TFLite interpreter for " << model_;
+		LOG(RPiDenoiseBstm, Error) << "Failed to build TFLite interpreter for " << config_.model;
 		return;
 	}
 	/*
@@ -440,41 +449,41 @@ void DenoiseBstm::initialise()
 	 * On the NPU the whole graph is one Teflon delegate node, which runs on
 	 * the calling thread, so the number makes no difference there.
 	 */
-	interpreter_->SetNumThreads(cpu_ ? cpuThreads_ : 1);
+	interpreter_->SetNumThreads(config_.cpu ? config_.cpuThreads : 1);
 
-	if (!cpu_) {
+	if (!config_.cpu) {
 		/*
 		 * Read by the bstm driver when the delegate opens the NPU, so it
 		 * must be set before then; the inputs' type is already known.
 		 */
 		if (!interpreter_->inputs().empty() &&
 		    interpreter_->tensor(interpreter_->inputs()[0])->type == kTfLiteFloat32)
-			setenv("BSTM_FLOAT", floatFormat_.c_str(), 0);
+			setenv("BSTM_FLOAT", config_.floatFormat.c_str(), 0);
 
 		TfLiteExternalDelegateOptions options =
-			TfLiteExternalDelegateOptionsDefault(delegate_.c_str());
+			TfLiteExternalDelegateOptionsDefault(config_.delegate.c_str());
 		tfDelegate_ = TfLiteExternalDelegateCreate(&options);
 		if (!tfDelegate_) {
 			LOG(RPiDenoiseBstm, Error)
-				<< "Failed to create the Teflon delegate from " << delegate_;
+				<< "Failed to create the Teflon delegate from " << config_.delegate;
 			return;
 		}
 
 		/* This is where the driver compiles the model (or finds it in its disk cache). */
 		if (interpreter_->ModifyGraphWithDelegate(tfDelegate_) != kTfLiteOk) {
 			LOG(RPiDenoiseBstm, Error)
-				<< "Failed to apply the Teflon delegate to " << model_;
+				<< "Failed to apply the Teflon delegate to " << config_.model;
 			return;
 		}
 	}
 
 	if (interpreter_->AllocateTensors() != kTfLiteOk) {
-		LOG(RPiDenoiseBstm, Error) << "Failed to allocate tensors for " << model_;
+		LOG(RPiDenoiseBstm, Error) << "Failed to allocate tensors for " << config_.model;
 		return;
 	}
 
 	/*
-	 * With cpu_, any delegate nodes are TFLite's own default CPU delegate
+	 * With config_.cpu, any delegate nodes are TFLite's own default CPU delegate
 	 * (XNNPACK), applied by AllocateTensors(); otherwise they're the NPU.
 	 */
 	unsigned int delegated = 0;
@@ -484,16 +493,16 @@ void DenoiseBstm::initialise()
 		if (nr && nr->second.builtin_code == kTfLiteBuiltinDelegate)
 			delegated++;
 	}
-	if (!cpu_ && !delegated)
-		LOG(RPiDenoiseBstm, Warning) << "No part of " << model_ << " runs on the NPU";
-	else if (!cpu_ && delegated != plan.size())
+	if (!config_.cpu && !delegated)
+		LOG(RPiDenoiseBstm, Warning) << "No part of " << config_.model << " runs on the NPU";
+	else if (!config_.cpu && delegated != plan.size())
 		LOG(RPiDenoiseBstm, Warning)
-			<< model_ << ": " << plan.size() - delegated << " of " << plan.size()
+			<< config_.model << ": " << plan.size() - delegated << " of " << plan.size()
 			<< " execution-plan nodes run on the CPU";
 
 	if (interpreter_->inputs().size() != 2 || interpreter_->outputs().size() != 2) {
 		LOG(RPiDenoiseBstm, Error)
-			<< model_ << " must have exactly two inputs (x, prev) and two outputs (r, a)";
+			<< config_.model << " must have exactly two inputs (x, prev) and two outputs (r, a)";
 		return;
 	}
 
@@ -514,7 +523,7 @@ void DenoiseBstm::initialise()
 	}
 	if (outR_ < 0 || outA_ < 0) {
 		LOG(RPiDenoiseBstm, Error)
-			<< model_ << ": outputs must be r [1, H, W, 16] and a [1, H, W, 1]";
+			<< config_.model << ": outputs must be r [1, H, W, 16] and a [1, H, W, 1]";
 		return;
 	}
 
@@ -530,7 +539,7 @@ void DenoiseBstm::initialise()
 		return;
 	if (int8[1] != int8[0] || int8[2] != int8[0] || int8[3] != int8[0]) {
 		LOG(RPiDenoiseBstm, Error)
-			<< model_ << ": inputs and outputs must be all int8 or all float32";
+			<< config_.model << ": inputs and outputs must be all int8 or all float32";
 		return;
 	}
 	isFloat_ = !int8[0];
@@ -541,14 +550,14 @@ void DenoiseBstm::initialise()
 		if (static_cast<unsigned int>(t->dims->data[1]) != netH_ ||
 		    static_cast<unsigned int>(t->dims->data[2]) != netW_) {
 			LOG(RPiDenoiseBstm, Error)
-				<< model_ << ": all inputs and outputs must be the same size";
+				<< config_.model << ": all inputs and outputs must be the same size";
 			return;
 		}
 	}
 
-	if (2 * minOverlap_ >= std::min(netW_, netH_)) {
+	if (2 * config_.minOverlap >= std::min(netW_, netH_)) {
 		LOG(RPiDenoiseBstm, Error)
-			<< "\"min_overlap\" (" << minOverlap_ << ") must be less than half the model's size ("
+			<< "\"min_overlap\" (" << config_.minOverlap << ") must be less than half the model's size ("
 			<< netW_ << "x" << netH_ << ")";
 		return;
 	}
@@ -556,11 +565,11 @@ void DenoiseBstm::initialise()
 	buildTables();
 
 	LOG(RPiDenoiseBstm, Info)
-		<< "Loaded " << model_ << " (" << kChannels << "x" << netH_ << "x" << netW_
+		<< "Loaded " << config_.model << " (" << kChannels << "x" << netH_ << "x" << netW_
 		<< "), " << delegated << "/" << plan.size()
-		<< (cpu_ ? " nodes delegated to XNNPACK, all on the CPU (" : " nodes on the NPU")
-		<< (cpu_ ? std::to_string(cpuThreads_) + " threads)" : "");
-	if (isFloat_ && !cpu_)
+		<< (config_.cpu ? " nodes delegated to XNNPACK, all on the CPU (" : " nodes on the NPU")
+		<< (config_.cpu ? std::to_string(config_.cpuThreads) + " threads)" : "");
+	if (isFloat_ && !config_.cpu)
 		LOG(RPiDenoiseBstm, Info)
 			<< "float32 model, BSTM_FLOAT=" << getenv("BSTM_FLOAT");
 	else if (isFloat_)
@@ -608,8 +617,15 @@ void DenoiseBstm::buildTables()
 void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Metadata *metadata)
 {
 	/*
+	 * initialise() failed (the model couldn't be loaded or isn't usable,
+	 * already logged): stay inactive, and let the camera run without us.
+	 */
+	if (!init_)
+		return;
+
+	/*
 	 * Restarting the camera in the same mode keeps the tile layout, the
-	 * buffers and the recurrent state (checkContinuity() still restarts
+	 * buffers and the recurrent state (checkForReset() still restarts
 	 * from frame 0 on a large jump in exposure). active_ is only set once
 	 * a mode has been set up, so the first call always sets up.
 	 */
@@ -623,17 +639,14 @@ void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 	height_ = cameraMode.height;
 	active_ = false;
 
-	if (!init_)
-		return;
-
 	/* One network pixel per 4x4 raw block; tiled when larger than the model. */
 	packW_ = width_ / 4;
 	packH_ = height_ / 4;
 	if (!packW_ || !packH_)
 		return;
 
-	layoutAxis(packW_, netW_, minOverlap_, tilesX_);
-	layoutAxis(packH_, netH_, minOverlap_, tilesY_);
+	layoutAxis(packW_, netW_, config_.minOverlap, tilesX_);
+	layoutAxis(packH_, netH_, config_.minOverlap, tilesY_);
 
 	/* Every tile's x, prev, r and a, each 64-byte aligned. */
 	auto align = [](size_t n) { return (n + 63) & ~size_t(63); };
@@ -657,24 +670,35 @@ void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 
 	/*
 	 * Only the part of each tile backed by the frame is ever packed, so
-	 * where the frame is smaller than the model, the rest keeps the
-	 * encoding of zero filled here for as long as this mode lasts.
+	 * where the frame is smaller than the model, the rest of its inputs
+	 * keeps the encoding of zero filled here for as long as this mode lasts.
 	 */
 	const size_t n = size_t(netW_) * netH_ * kChannels;
 	for (unsigned int k = 0; k < tiles(); k++) {
-		if (isFloat_)
+		if (isFloat_) {
 			std::fill(tileX<float>(k), tileX<float>(k) + n, 0.0f);
-		else
+			std::fill(tilePrev<float>(k), tilePrev<float>(k) + n, 0.0f);
+		} else {
 			std::fill(tileX<int8_t>(k), tileX<int8_t>(k) + n, int8_t(xZp_));
+			std::fill(tilePrev<int8_t>(k), tilePrev<int8_t>(k) + n, int8_t(prevZp_));
+		}
 	}
 
-	if (isFloat_)
-		prev_.clear();
-	else
-		prev_.assign(size_t(packW_) * packH_ * kChannels, 0);
+	/* Every frame position is finished by exactly one tile. */
+	for (const TileAxis *axis : { &tilesX_, &tilesY_ }) {
+		ASSERT(axis->region.size() == axis->count + 1 && axis->region.front() == 0);
+		ASSERT(std::is_sorted(axis->region.begin(), axis->region.end()));
+	}
+	ASSERT(tilesX_.region.back() == packW_ && tilesY_.region.back() == packH_);
+
+	const size_t state = size_t(packW_) * packH_ * kChannels;
+	prev_.assign(isFloat_ ? 0 : state, 0);
+	prevQ_.assign(isFloat_ ? 0 : state, int8_t(prevZp_));
+	prevFloat_.assign(isFloat_ ? state : 0, 0.0f);
 
 	dumpCount_ = 0;
 	active_ = true;
+	lastExposure_ = 0.0;
 	reset();
 
 	auto overlaps = [](const TileAxis &axis, unsigned int net) {
@@ -692,7 +716,7 @@ void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 		<< "Bayer " << width_ << "x" << height_ << " (" << packW_ << "x" << packH_
 		<< " network pixels) -> " << tilesX_.count << "x" << tilesY_.count << " tiles of "
 		<< netW_ << "x" << netH_ << ", overlaps " << overlaps(tilesX_, netW_) << " x "
-		<< overlaps(tilesY_, netH_) << " (minimum " << minOverlap_ << "), "
+		<< overlaps(tilesY_, netH_) << " (minimum " << config_.minOverlap << "), "
 		<< bytes / 1024 << " KiB of tile buffers";
 }
 
@@ -701,51 +725,44 @@ void DenoiseBstm::setMode([[maybe_unused]] DenoiseMode mode)
 }
 
 /*
- * Restart from frame 0: every tile's prev input becomes real zeros (for
- * int8, its zero point, -128, not int8 0), and the next blend ignores alpha.
+ * Restart from frame 0: the state becomes zeros, so the tiles' prev inputs
+ * are packed as real zeros (for int8, its zero point, -128, not int8 0), and
+ * the next blend ignores alpha.
  */
 void DenoiseBstm::reset()
 {
-	const size_t n = size_t(netW_) * netH_ * kChannels;
-	for (unsigned int k = 0; tileBuffers_ && k < tiles(); k++) {
-		if (isFloat_)
-			std::fill(tilePrev<float>(k), tilePrev<float>(k) + n, 0.0f);
-		else
-			std::fill(tilePrev<int8_t>(k), tilePrev<int8_t>(k) + n, int8_t(prevZp_));
-	}
+	std::fill(prev_.begin(), prev_.end(), 0);
+	std::fill(prevQ_.begin(), prevQ_.end(), int8_t(prevZp_));
+	std::fill(prevFloat_.begin(), prevFloat_.end(), 0.0f);
 
 	firstFrame_ = true;
-	lastExposure_ = 0.0;
 }
 
 /*
  * Restart on a large jump in exposure time x analogue gain, which the
- * network was never trained across. Returns true if we reset.
+ * network was never trained across.
  */
-bool DenoiseBstm::checkContinuity(Metadata *imageMetadata)
+void DenoiseBstm::checkForReset(Metadata *imageMetadata)
 {
 	DeviceStatus deviceStatus;
 	if (imageMetadata->get("device.status", deviceStatus) != 0)
-		return false;
+		return;
 
 	const double exposure = deviceStatus.exposureTime.get<std::micro>() * deviceStatus.analogueGain;
-	if (!(exposure > 0.0))
-		return false;
+	if (exposure <= 0.0)
+		return;
 
-	bool jump = false;
-	if (lastExposure_ > 0.0) {
-		const double ratio = exposure / lastExposure_;
-		jump = ratio > resetRatio_ || ratio < 1.0 / resetRatio_;
-	}
-	if (jump) {
+	const double last = std::exchange(lastExposure_, exposure);
+	if (last <= 0.0)
+		return;
+
+	const double ratio = exposure / last;
+	if (ratio > config_.resetRatio || ratio * config_.resetRatio < 1.0) {
 		LOG(RPiDenoiseBstm, Debug)
-			<< "Exposure x gain jumped from " << lastExposure_ << " to " << exposure
+			<< "Exposure x gain jumped from " << last << " to " << exposure
 			<< " -- restarting";
 		reset();
 	}
-	lastExposure_ = exposure;
-
-	return jump;
 }
 
 /*
@@ -809,30 +826,31 @@ bool DenoiseBstm::waitDone(unsigned int tiles)
 }
 
 /*
- * Pack tile k's part of the raw Bayer frame into its x input: network pixel
- * (x,y) of a tile at (ox,oy) covers raw rows [4(oy+y),4(oy+y)+4) and columns
- * [4(ox+x),4(ox+x)+4), raw offset (dx,dy) going to channel rawToChannel(dx,dy),
- * each sample being its square root from table: quantised (xqTable_) for an
- * int8 model, or in float (xfTable_).
- *
- * The 16 scalar table lookups per network pixel make this compute-bound
- * rather than memory-bound, so it is threaded (2.1 ms -> 1.4 ms for a whole
- * frame with 2 threads on a Pi 5).
+ * Pack tile k's inputs. x: its part of the raw Bayer frame, network pixel
+ * (x,y) of a tile at (ox,oy) covering raw rows [4(oy+y),4(oy+y)+4) and
+ * columns [4(ox+x),4(ox+x)+4), raw offset (dx,dy) going to channel
+ * rawToChannel(dx,dy), each sample being its square root from table:
+ * quantised (xqTable_) for an int8 model, or in float (xfTable_). prev: its
+ * part of the recurrent state, copied from prevQ_ (already quantised) for an
+ * int8 model, or from prevFloat_. After a reset that is the encoding of zero.
  */
 template<typename T>
 void DenoiseBstm::packTile(unsigned int k, const uint16_t *bayer16, unsigned int stridePx,
 			   const T *table)
 {
-	const unsigned int netW = netW_, validW = tilesX_.valid, validH = tilesY_.valid;
+	const unsigned int netW = netW_, packW = packW_;
+	const unsigned int validW = tilesX_.valid, validH = tilesY_.valid;
 	const unsigned int ox = tilesX_.origin[k % tilesX_.count];
 	const unsigned int oy = tilesY_.origin[k / tilesX_.count];
 	T *in = tileX<T>(k);
+	T *prevIn = tilePrev<T>(k);
+	const T *state;
+	if constexpr (std::is_same_v<T, int8_t>)
+		state = prevQ_.data();
+	else
+		state = prevFloat_.data();
 
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(threads_) schedule(static)
-#endif
-	for (int y_ = 0; y_ < int(validH); ++y_) {
-		const unsigned int y = static_cast<unsigned int>(y_);
+	for (unsigned int y = 0; y < validH; ++y) {
 		T *d = in + size_t(y) * netW * kChannels;
 		const uint16_t *rows[4];
 		for (unsigned int dy = 0; dy < 4; ++dy)
@@ -846,12 +864,17 @@ void DenoiseBstm::packTile(unsigned int k, const uint16_t *bayer16, unsigned int
 					p[rawToChannel(dx, dy)] = table[r[dx] >> kRawShift];
 			}
 		}
+
+		/* The tile's row of prev is one contiguous run of the state. */
+		const T *s = state + (size_t(oy + y) * packW + ox) * kChannels;
+		std::copy(s, s + size_t(validW) * kChannels, prevIn + size_t(y) * netW * kChannels);
 	}
 }
 
 /*
- * Complete frame rows [y0, y1) from the tiles' outputs, all in float and in
- * square-root space, for each network pixel and channel k:
+ * Complete the region tile k finishes (see TileAxis) from the tiles'
+ * outputs, all in float and in square-root space, for each network pixel and
+ * channel:
  *
  *   s_t  = clamp(xf + r_t, 0, 1)                       for each covering tile t
  *   out  = sum_t w_t s_t                               on the first frame
@@ -859,27 +882,31 @@ void DenoiseBstm::packTile(unsigned int k, const uint16_t *bayer16, unsigned int
  *
  * with xf the current frame's square root (looked up again from the raw
  * values, which are still in the buffer), alpha_t = sigmoid(a_t), one per
- * network pixel, and w_t the tiles' cross-fade weights, which sum to 1. A
- * pixel covered by a single tile (weight 1, and all of them when the model
+ * network pixel, and w_t the tiles' cross-fade weights, which sum to 1. Every
+ * covering tile is done by the time tile k is, as tiles run in raster order.
+ * A pixel covered by a single tile (weight 1, and all of them when the model
  * is as large as the frame) takes exactly the arithmetic of a single
- * prev + alpha * (s - prev). out is kept for the next frame, and written
- * back over the raw buffer squared, as round(out^2 * 65535).
+ * prev + alpha * (s - prev). out becomes the state for the next frame, and is
+ * written back over the raw buffer squared, as round(out^2 * 65535). Nothing
+ * is written to the tiles' buffers.
  *
- * int8 model: r and a are dequantised, (q - zero point) * scale, and alpha
- * comes from alphaTable_. out is kept in prev_ (as 16-bit fixed point,
- * round(out * 65535)), and written quantised to the prev input of every tile
- * covering the pixel, ready for the next frame.
+ * int8 model: r and a are dequantised, (q - zero point) * scale, alpha comes
+ * from alphaTable_, and the state is prev_ (16-bit fixed point), with
+ * prevQ_ quantised from the unrounded result for the next frame's input.
  */
-void DenoiseBstm::blendBandInt8(uint16_t *bayer16, unsigned int stridePx, unsigned int y0,
-				unsigned int y1)
+void DenoiseBstm::blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned int stridePx)
 {
 	const unsigned int netW = netW_, packW = packW_, nx = tilesX_.count;
-	/* demo_: write back the right half only (but update everything else). */
-	const unsigned int xStart = demo_ ? packW / 2 : 0;
+	const unsigned int tx = k % nx, ty = k / nx;
+	const unsigned int x0 = tilesX_.region[tx], x1 = tilesX_.region[tx + 1];
+	const unsigned int y0 = tilesY_.region[ty], y1 = tilesY_.region[ty + 1];
+	/* config_.demo: write back the right half only (but update everything else). */
+	const unsigned int xStart = std::max(x0, config_.demo ? packW / 2 : 0);
 	const bool first = firstFrame_;
 	const float *xfTable = xfTable_.data();
 	const float *alphaTable = alphaTable_.data();
 	uint16_t *prevBuf = prev_.data();
+	int8_t *prevQBuf = prevQ_.data();
 	const float rScale = rScale_;
 	const int rZp = rZp_;
 	const float prevInvScale = 1.0f / prevScale_;
@@ -896,21 +923,19 @@ void DenoiseBstm::blendBandInt8(uint16_t *bayer16, unsigned int stridePx, unsign
 	const float32x4_t vInvMax = vdupq_n_f32(1.0f / 65535.0f);
 #endif
 
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(threads_) schedule(static)
-#endif
-	for (int y_ = int(y0); y_ < int(y1); ++y_) {
-		const unsigned int y = static_cast<unsigned int>(y_);
+	for (unsigned int y = y0; y < y1; ++y) {
 		const Cover cy = cover(tilesY_, y);
 		uint16_t *pRow = prevBuf + size_t(y) * packW * kChannels;
+		int8_t *qRow = prevQBuf + size_t(y) * packW * kChannels;
 		uint16_t *rows[4];
 		for (unsigned int dy = 0; dy < 4; ++dy)
 			rows[dy] = bayer16 + size_t(4 * y + dy) * stridePx;
 
-		for (unsigned int x = 0; x < packW; ++x) {
+		for (unsigned int x = x0; x < x1; ++x) {
 			alignas(16) float xf[kChannels];
 			gatherSqrt(rows, x, xfTable, xf);
 			uint16_t *p = pRow + size_t(x) * kChannels;
+			int8_t *pq = qRow + size_t(x) * kChannels;
 			const Cover cx = cover(tilesX_, x);
 
 			/* The covering tiles (1, 2 or 4), their weights and pixel offsets. */
@@ -933,8 +958,10 @@ void DenoiseBstm::blendBandInt8(uint16_t *bayer16, unsigned int stridePx, unsign
 
 			float32x4x4_t out;
 			if (nt == 1) {
-				const float32x4x4_t rf = residualMinusZp(tileR<int8_t>(tile[0]) + local[0] * kChannels, vRZp);
-				const float32x4_t vAlpha = vdupq_n_f32(alphaTable[tileA<int8_t>(tile[0])[local[0]] + 128]);
+				const float32x4x4_t rf =
+					residualMinusZp(tileR<int8_t>(tile[0]) + local[0] * kChannels, vRZp);
+				const float32x4_t vAlpha =
+					vdupq_n_f32(alphaTable[tileA<int8_t>(tile[0])[local[0]] + 128]);
 				for (unsigned int i = 0; i < 4; ++i) {
 					/* The residual's dequantising multiply is fused with the skip add. */
 					float32x4_t s = vfmaq_f32(xv.val[i], rf.val[i], vRScale);
@@ -945,43 +972,42 @@ void DenoiseBstm::blendBandInt8(uint16_t *bayer16, unsigned int stridePx, unsign
 			} else {
 				float32x4x4_t acc = { vZero, vZero, vZero, vZero };
 				for (unsigned int t = 0; t < nt; t++) {
-					const float32x4x4_t rf = residualMinusZp(tileR<int8_t>(tile[t]) + local[t] * kChannels, vRZp);
+					const float32x4x4_t rf =
+						residualMinusZp(tileR<int8_t>(tile[t]) + local[t] * kChannels, vRZp);
 					const float alpha = alphaTable[tileA<int8_t>(tile[t])[local[t]] + 128];
 					const float32x4_t vW = vdupq_n_f32(first ? weight[t] : weight[t] * alpha);
 					for (unsigned int i = 0; i < 4; ++i) {
 						float32x4_t s = vfmaq_f32(xv.val[i], rf.val[i], vRScale);
 						s = vminq_f32(vmaxq_f32(s, vZero), vOne);
-						acc.val[i] = vfmaq_f32(acc.val[i], vW, first ? s : vsubq_f32(s, pv.val[i]));
+						acc.val[i] = vfmaq_f32(acc.val[i], vW,
+								       first ? s : vsubq_f32(s, pv.val[i]));
 					}
 				}
 				for (unsigned int i = 0; i < 4; ++i)
 					out.val[i] = first ? acc.val[i] : vaddq_f32(pv.val[i], acc.val[i]);
 			}
 			storePrev(p, out, vRawMax);
-
-			const int8x16_t q = quantisePrev(out, vPrevInvScale, vPrevZp);
-			for (unsigned int t = 0; t < nt; t++)
-				vst1q_s8(tilePrev<int8_t>(tile[t]) + local[t] * kChannels, q);
+			vst1q_s8(pq, quantisePrev(out, vPrevInvScale, vPrevZp));
 #else
 			float out[kChannels];
-			for (unsigned int k = 0; k < kChannels; ++k) {
-				const float pk = float(p[k]) * (1.0f / 65535.0f);
+			for (unsigned int c = 0; c < kChannels; ++c) {
+				const float pc = float(p[c]) * (1.0f / 65535.0f);
 				float acc = 0.0f;
 				for (unsigned int t = 0; t < nt; t++) {
 					const int8_t *rq = tileR<int8_t>(tile[t]) + local[t] * kChannels;
 					const float alpha = alphaTable[tileA<int8_t>(tile[t])[local[t]] + 128];
-					const float s = std::clamp(std::fma(float(int(rq[k]) - rZp), rScale, xf[k]), 0.0f, 1.0f);
+					const float s = std::clamp(std::fma(float(int(rq[c]) - rZp), rScale, xf[c]),
+								   0.0f, 1.0f);
 					if (nt == 1)
-						acc = first ? s : std::fma(alpha, s - pk, pk);
+						acc = first ? s : std::fma(alpha, s - pc, pc);
 					else
-						acc = std::fma(first ? weight[t] : weight[t] * alpha, first ? s : s - pk, acc);
+						acc = std::fma(first ? weight[t] : weight[t] * alpha,
+							       first ? s : s - pc, acc);
 				}
-				out[k] = nt == 1 || first ? acc : pk + acc;
-				p[k] = uint16_t(std::lround(out[k] * 65535.0f));
-				const int8_t q = int8_t(std::clamp(int(std::lround(out[k] * prevInvScale)) + prevZp,
-								   -128, 127));
-				for (unsigned int t = 0; t < nt; t++)
-					tilePrev<int8_t>(tile[t])[local[t] * kChannels + k] = q;
+				out[c] = nt == 1 || first ? acc : pc + acc;
+				p[c] = uint16_t(std::lround(out[c] * 65535.0f));
+				pq[c] = int8_t(std::clamp(int(std::lround(out[c] * prevInvScale)) + prevZp,
+							  -128, 127));
 			}
 #endif
 
@@ -992,40 +1018,38 @@ void DenoiseBstm::blendBandInt8(uint16_t *bayer16, unsigned int stridePx, unsign
 }
 
 /*
- * As blendBandInt8(), for a float model: r and a need no dequantising, alpha
- * is computed directly (one exp per network pixel and tile), and out is kept
- * in the covering tiles' float prev inputs themselves (identical copies,
- * read from the first), which are read back next frame. TFLite never writes
- * its inputs, and the Teflon delegate converts them to bf16/fp16 without
- * touching the originals.
+ * As blendRegionInt8(), for a float model: r and a need no dequantising,
+ * alpha is computed directly (one exp per network pixel and tile), and the
+ * state is prevFloat_.
  */
-void DenoiseBstm::blendBandFloat(uint16_t *bayer16, unsigned int stridePx, unsigned int y0,
-				 unsigned int y1)
+void DenoiseBstm::blendRegionFloat(unsigned int k, uint16_t *bayer16, unsigned int stridePx)
 {
 	const unsigned int netW = netW_, packW = packW_, nx = tilesX_.count;
-	/* demo_: write back the right half only (but update everything else). */
-	const unsigned int xStart = demo_ ? packW / 2 : 0;
+	const unsigned int tx = k % nx, ty = k / nx;
+	const unsigned int x0 = tilesX_.region[tx], x1 = tilesX_.region[tx + 1];
+	const unsigned int y0 = tilesY_.region[ty], y1 = tilesY_.region[ty + 1];
+	/* config_.demo: write back the right half only (but update everything else). */
+	const unsigned int xStart = std::max(x0, config_.demo ? packW / 2 : 0);
 	const bool first = firstFrame_;
 	const float *xfTable = xfTable_.data();
+	float *prevBuf = prevFloat_.data();
 
 #if defined(__ARM_NEON)
 	const float32x4_t vZero = vdupq_n_f32(0.0f);
 	const float32x4_t vOne = vdupq_n_f32(1.0f);
 #endif
 
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(threads_) schedule(static)
-#endif
-	for (int y_ = int(y0); y_ < int(y1); ++y_) {
-		const unsigned int y = static_cast<unsigned int>(y_);
+	for (unsigned int y = y0; y < y1; ++y) {
 		const Cover cy = cover(tilesY_, y);
+		float *pRow = prevBuf + size_t(y) * packW * kChannels;
 		uint16_t *rows[4];
 		for (unsigned int dy = 0; dy < 4; ++dy)
 			rows[dy] = bayer16 + size_t(4 * y + dy) * stridePx;
 
-		for (unsigned int x = 0; x < packW; ++x) {
+		for (unsigned int x = x0; x < x1; ++x) {
 			alignas(16) float xf[kChannels];
 			gatherSqrt(rows, x, xfTable, xf);
+			float *p = pRow + size_t(x) * kChannels;
 			const Cover cx = cover(tilesX_, x);
 
 			unsigned int nt = 0, tile[4];
@@ -1034,11 +1058,10 @@ void DenoiseBstm::blendBandFloat(uint16_t *bayer16, unsigned int stridePx, unsig
 			for (unsigned int i = 0; i < cy.n; i++) {
 				for (unsigned int j = 0; j < cx.n; j++, nt++) {
 					tile[nt] = cy.tile[i] * nx + cx.tile[j];
-					local[nt] = (size_t(cy.local[i]) * netW + cx.local[j]) * kChannels;
+					local[nt] = size_t(cy.local[i]) * netW + cx.local[j];
 					weight[nt] = cy.weight[i] * cx.weight[j];
 				}
 			}
-			float *p = tilePrev<float>(tile[0]) + local[0];
 
 #if defined(__ARM_NEON)
 			const float32x4x4_t xv = vld1q_f32_x4(xf);
@@ -1048,8 +1071,8 @@ void DenoiseBstm::blendBandFloat(uint16_t *bayer16, unsigned int stridePx, unsig
 
 			float32x4x4_t out;
 			if (nt == 1) {
-				const float32x4x4_t rv = vld1q_f32_x4(tileR<float>(tile[0]) + local[0]);
-				const float a = tileA<float>(tile[0])[local[0] / kChannels];
+				const float32x4x4_t rv = vld1q_f32_x4(tileR<float>(tile[0]) + local[0] * kChannels);
+				const float a = tileA<float>(tile[0])[local[0]];
 				const float32x4_t vAlpha = vdupq_n_f32(1.0f / (1.0f + std::exp(-a)));
 				for (unsigned int i = 0; i < 4; ++i) {
 					float32x4_t s = vaddq_f32(xv.val[i], rv.val[i]);
@@ -1060,39 +1083,41 @@ void DenoiseBstm::blendBandFloat(uint16_t *bayer16, unsigned int stridePx, unsig
 			} else {
 				float32x4x4_t acc = { vZero, vZero, vZero, vZero };
 				for (unsigned int t = 0; t < nt; t++) {
-					const float32x4x4_t rv = vld1q_f32_x4(tileR<float>(tile[t]) + local[t]);
-					const float a = tileA<float>(tile[t])[local[t] / kChannels];
+					const float32x4x4_t rv =
+						vld1q_f32_x4(tileR<float>(tile[t]) + local[t] * kChannels);
+					const float a = tileA<float>(tile[t])[local[t]];
 					const float alpha = 1.0f / (1.0f + std::exp(-a));
 					const float32x4_t vW = vdupq_n_f32(first ? weight[t] : weight[t] * alpha);
 					for (unsigned int i = 0; i < 4; ++i) {
 						float32x4_t s = vaddq_f32(xv.val[i], rv.val[i]);
 						s = vminq_f32(vmaxq_f32(s, vZero), vOne);
-						acc.val[i] = vfmaq_f32(acc.val[i], vW, first ? s : vsubq_f32(s, pv.val[i]));
+						acc.val[i] = vfmaq_f32(acc.val[i], vW,
+								       first ? s : vsubq_f32(s, pv.val[i]));
 					}
 				}
 				for (unsigned int i = 0; i < 4; ++i)
 					out.val[i] = first ? acc.val[i] : vaddq_f32(pv.val[i], acc.val[i]);
 			}
-			for (unsigned int t = 0; t < nt; t++)
-				vst1q_f32_x4(tilePrev<float>(tile[t]) + local[t], out);
+			vst1q_f32_x4(p, out);
 #else
 			float out[kChannels];
-			for (unsigned int k = 0; k < kChannels; ++k) {
-				const float pk = p[k];
+			for (unsigned int c = 0; c < kChannels; ++c) {
+				const float pc = p[c];
 				float acc = 0.0f;
 				for (unsigned int t = 0; t < nt; t++) {
-					const float a = tileA<float>(tile[t])[local[t] / kChannels];
+					const float a = tileA<float>(tile[t])[local[t]];
 					const float alpha = 1.0f / (1.0f + std::exp(-a));
-					const float s = std::clamp(xf[k] + tileR<float>(tile[t])[local[t] + k], 0.0f, 1.0f);
+					const float s = std::clamp(xf[c] + tileR<float>(tile[t])[local[t] * kChannels + c],
+								   0.0f, 1.0f);
 					if (nt == 1)
-						acc = first ? s : std::fma(alpha, s - pk, pk);
+						acc = first ? s : std::fma(alpha, s - pc, pc);
 					else
-						acc = std::fma(first ? weight[t] : weight[t] * alpha, first ? s : s - pk, acc);
+						acc = std::fma(first ? weight[t] : weight[t] * alpha,
+							       first ? s : s - pc, acc);
 				}
-				out[k] = nt == 1 || first ? acc : pk + acc;
+				out[c] = nt == 1 || first ? acc : pc + acc;
 			}
-			for (unsigned int t = 0; t < nt; t++)
-				std::copy(out, out + kChannels, tilePrev<float>(tile[t]) + local[t]);
+			std::copy(out, out + kChannels, p);
 #endif
 
 			if (x >= xStart)
@@ -1101,11 +1126,11 @@ void DenoiseBstm::blendBandFloat(uint16_t *bayer16, unsigned int stridePx, unsig
 	}
 }
 
-/* Debug only: see dumpDir_. */
+/* Debug only: see config_.dumpDir. */
 void DenoiseBstm::dumpFrame(const uint16_t *bayer16, unsigned int stridePx, const char *what)
 {
 	std::ostringstream name;
-	name << dumpDir_ << "/" << what << "_" << std::setw(4) << std::setfill('0') << dumpCount_
+	name << config_.dumpDir << "/" << what << "_" << std::setw(4) << std::setfill('0') << dumpCount_
 	     << ".raw";
 	std::ofstream f(name.str(), std::ios::binary);
 	for (unsigned int y = 0; y < height_; ++y)
@@ -1118,13 +1143,12 @@ void DenoiseBstm::dumpFrame(const uint16_t *bayer16, unsigned int stridePx, cons
 /*
  * The tiles are pipelined: this thread packs them all in raster order,
  * handing each to the inference thread as it's ready (packing is much
- * quicker than inference, so it soon runs ahead), then blends the frame in
- * bands, one per row of tiles, as soon as the tiles covering each band are
- * done. A band runs from the end of the cross-fade with the previous row of
- * tiles to the end of the cross-fade with the next, so it needs its own row
- * of tiles and the next one. Raw pixels are only overwritten once every tile
- * has been packed, and each band reads and writes only its own pixels. With
- * a single tile this is pack, invoke, blend, as before.
+ * quicker than inference, so it soon runs ahead), then blends the region
+ * each tile finishes as soon as that tile is done, so that when the last
+ * tile is done only its own region is left. Raw pixels are only overwritten
+ * once every tile has been packed (tiles also read the raw pixels they
+ * share with their neighbours), and each region reads and writes only its
+ * own pixels. With a single tile this is pack, invoke, blend, as before.
  */
 void DenoiseBstm::prepare(Metadata *imageMetadata)
 {
@@ -1152,7 +1176,7 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 		return;
 	}
 
-	checkContinuity(imageMetadata);
+	checkForReset(imageMetadata);
 
 	const Clock::time_point tStart = Clock::now();
 	dmabufSyncStart(bayer.first);
@@ -1160,15 +1184,15 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 
 	uint16_t *bayer16 = reinterpret_cast<uint16_t *>(bayer.second.data());
 	const unsigned int stridePx = rowBytes / sizeof(uint16_t);
-	const bool dump = !dumpDir_.empty() && dumpCount_ < dumpFrames_;
+	const bool dump = !config_.dumpDir.empty() && dumpCount_ < config_.dumpFrames;
 
 	if (dump) {
 		dumpFrame(bayer16, stridePx, "in");
-		std::ofstream(dumpDir_ + "/frames.txt", dumpCount_ ? std::ios::app : std::ios::trunc)
+		std::ofstream(config_.dumpDir + "/frames.txt", dumpCount_ ? std::ios::app : std::ios::trunc)
 			<< dumpCount_ << " " << (firstFrame_ ? 1 : 0) << "\n";
 	}
 
-	const unsigned int nTiles = tiles(), nx = tilesX_.count, ny = tilesY_.count;
+	const unsigned int nTiles = tiles();
 	startFrame(nTiles);
 
 	const Clock::time_point t0 = Clock::now();
@@ -1182,23 +1206,24 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 	const double packMs = msSince(t0);
 
 	double waitMs = 0.0, blendMs = 0.0;
+	Clock::time_point tLast = Clock::now();
 	bool ok = true;
-	for (unsigned int j = 0; j < ny && ok; j++) {
+	for (unsigned int k = 0; k < nTiles; k++) {
 		const Clock::time_point tw = Clock::now();
-		ok = waitDone(std::min(ny, j + 2) * nx);
+		ok = waitDone(k + 1);
 		waitMs += msSince(tw);
 		if (!ok)
 			break;
 
-		const unsigned int y0 = j ? tilesY_.rampEnd[j - 1] : 0;
-		const unsigned int y1 = j + 1 < ny ? tilesY_.rampEnd[j] : packH_;
-		const Clock::time_point tb = Clock::now();
+		tLast = Clock::now();
 		if (isFloat_)
-			blendBandFloat(bayer16, stridePx, y0, y1);
+			blendRegionFloat(k, bayer16, stridePx);
 		else
-			blendBandInt8(bayer16, stridePx, y0, y1);
-		blendMs += msSince(tb);
+			blendRegionInt8(k, bayer16, stridePx);
+		blendMs += msSince(tLast);
 	}
+	/* What's left once the last tile is done: blending its own region. */
+	const double tailMs = msSince(tLast);
 
 	double npuMs;
 	{
@@ -1226,24 +1251,26 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 	LOG(RPiDenoiseBstm, Debug)
 		<< "sync " << syncStartMs << " + " << syncEndMs << " ms, pack " << packMs
 		<< " ms, network " << npuMs << " ms (" << nTiles << " tiles), waiting " << waitMs
-		<< " ms, blend " << blendMs << " ms, total " << msSince(tStart) << " ms";
+		<< " ms, blend " << blendMs << " ms (last tile " << tailMs << " ms), total "
+		<< msSince(tStart) << " ms";
 
 	/*
 	 * The classic stages' noise thresholds scale with the noise model's
 	 * constant and slope. CDN's threshold is deviation * slope + constant,
 	 * so scaling the noise model scales the threshold itself.
 	 */
-	scaleStatus<SdnStatus>(imageMetadata, "sdn.status", sdnFactor_, [](SdnStatus &st, double f) {
-		st.noiseConstant *= f;
-		st.noiseSlope *= f;
-	});
-	scaleStatus<TdnStatus>(imageMetadata, "tdn.status", tdnFactor_, [](TdnStatus &st, double f) {
-		st.noiseConstant *= f;
-		st.noiseSlope *= f;
-	});
-	scaleStatus<CdnStatus>(imageMetadata, "cdn.status", cdnFactor_, [](CdnStatus &st, double f) {
-		st.threshold *= f;
-	});
+	scaleStatus<SdnStatus>(imageMetadata, "sdn.status", config_.sdnFactor,
+			       [](SdnStatus &st, double f) {
+				       st.noiseConstant *= f;
+				       st.noiseSlope *= f;
+			       });
+	scaleStatus<TdnStatus>(imageMetadata, "tdn.status", config_.tdnFactor,
+			       [](TdnStatus &st, double f) {
+				       st.noiseConstant *= f;
+				       st.noiseSlope *= f;
+			       });
+	scaleStatus<CdnStatus>(imageMetadata, "cdn.status", config_.cdnFactor,
+			       [](CdnStatus &st, double f) { st.threshold *= f; });
 }
 
 /* Register algorithm with the system. */

@@ -49,13 +49,15 @@ public:
 	 * The tile layout along one axis, in network (packed) pixels. Each
 	 * position of the frame is covered by tile0[p] with weight weight0[p],
 	 * and, where weight0[p] < 1, also by tile0[p] + 1 with the rest. The
-	 * weights ramp linearly across the middle of each overlap.
+	 * weights ramp linearly across the middle of each overlap. Tile i
+	 * finishes positions [region[i], region[i + 1]): it's the last tile
+	 * contributing to them, so they can be blended as soon as it's done.
 	 */
 	struct TileAxis {
 		unsigned int count = 0; /* tiles along this axis */
 		unsigned int valid = 0; /* network pixels per tile backed by the frame */
 		std::vector<unsigned int> origin; /* each tile's first frame position */
-		std::vector<unsigned int> rampEnd; /* end of the ramp between tiles i and i + 1 */
+		std::vector<unsigned int> region; /* count + 1 boundaries, from 0 to the frame size */
 		std::vector<uint16_t> tile0;
 		std::vector<float> weight0;
 	};
@@ -65,11 +67,11 @@ private:
 			 float &scale, int &zp);
 	void buildTables();
 	void reset();
-	bool checkContinuity(Metadata *imageMetadata);
+	void checkForReset(Metadata *imageMetadata);
 	template<typename T>
 	void packTile(unsigned int k, const uint16_t *bayer16, unsigned int stridePx, const T *table);
-	void blendBandInt8(uint16_t *bayer16, unsigned int stridePx, unsigned int y0, unsigned int y1);
-	void blendBandFloat(uint16_t *bayer16, unsigned int stridePx, unsigned int y0, unsigned int y1);
+	void blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned int stridePx);
+	void blendRegionFloat(unsigned int k, uint16_t *bayer16, unsigned int stridePx);
 	void dumpFrame(const uint16_t *bayer16, unsigned int stridePx, const char *what);
 
 	void npuLoop();
@@ -88,81 +90,83 @@ private:
 	template<typename T>
 	T *tileA(unsigned int k) const { return reinterpret_cast<T *>(tileBase(k) + offA_); }
 
-	std::string model_;
+	/* Parameters from the tuning file, fixed once read. */
+	struct Config {
+		int read(const libcamera::ValueNode &params);
 
-	/* Path to Mesa's libteflon.so, the TFLite external delegate. */
-	std::string delegate_;
+		/* The TFLite model (int8 or float32); its size is the tile size. */
+		std::string model;
 
-	/*
-	 * NPU arithmetic for a float32 model, "bf16" or "fp16", passed to the
-	 * bstm driver as BSTM_FLOAT when the delegate is created (plain fp32
-	 * doesn't compile for this network). An existing BSTM_FLOAT in the
-	 * environment takes precedence. Unused for an int8 model.
-	 */
-	std::string floatFormat_;
+		/* Path to Mesa's libteflon.so, the TFLite external delegate. */
+		std::string delegate;
 
-	/*
-	 * How much of the classic PISP hardware denoise stages to keep on top
-	 * of ours. 0 erases a stage's status, so it doesn't run at all on a
-	 * frame we've handled ourselves; otherwise its noise constant and slope
-	 * (for CDN, its threshold, which is linear in them) are multiplied by
-	 * the factor, so 1 leaves the stage as it is. For SDN only the first
-	 * noise constant/slope pair is scaled.
-	 */
-	double sdnFactor_ = 0.0;
-	double tdnFactor_ = 0.0;
-	double cdnFactor_ = 0.0;
+		/*
+		 * NPU arithmetic for a float32 model, "bf16" or "fp16", passed to
+		 * the bstm driver as BSTM_FLOAT when the delegate is created (plain
+		 * fp32 doesn't compile for this network). An existing BSTM_FLOAT
+		 * in the environment takes precedence. Unused for an int8 model.
+		 */
+		std::string floatFormat;
 
-	/*
-	 * When set, everything runs as normal (so the recurrent state stays
-	 * correct) but only the right half of the denoised result is written
-	 * back over the raw buffer, leaving the left half untouched for
-	 * side-by-side comparison.
-	 */
-	bool demo_ = false;
+		/*
+		 * How much of the classic PISP hardware denoise stages to keep on
+		 * top of ours. 0 erases a stage's status, so it doesn't run at all
+		 * on a frame we've handled ourselves; otherwise its noise constant
+		 * and slope (for CDN, its threshold, which is linear in them) are
+		 * multiplied by the factor, so 1 leaves the stage as it is. For SDN
+		 * only the first noise constant/slope pair is scaled.
+		 */
+		double sdnFactor = 0.0;
+		double tdnFactor = 0.0;
+		double cdnFactor = 0.0;
 
-	/*
-	 * Threads for the pack and blend passes. 2 is fastest: more speed up
-	 * the passes a little but slow the inference thread (npuThread_),
-	 * which needs a core of its own, by more.
-	 */
-	int threads_ = 2;
+		/*
+		 * When set, everything runs as normal (so the recurrent state stays
+		 * correct) but only the right half of the denoised result is
+		 * written back over the raw buffer, leaving the left half untouched
+		 * for side-by-side comparison.
+		 */
+		bool demo = false;
 
-	/*
-	 * The minimum overlap between neighbouring tiles, in network pixels
-	 * (4 raw pixels each). The tiles are spread evenly over the frame, so
-	 * the actual overlap is usually larger. Unused when the model is as
-	 * large as the frame.
-	 */
-	unsigned int minOverlap_ = 4;
+		/*
+		 * The minimum overlap between neighbouring tiles, in network pixels
+		 * (4 raw pixels each). The tiles are spread evenly over the frame,
+		 * so the actual overlap is usually larger. Unused when the model is
+		 * as large as the frame.
+		 */
+		unsigned int minOverlap = 4;
 
-	/*
-	 * Run the whole model on the CPU, with TFLite's own kernels (and its
-	 * default XNNPACK delegate, where it applies), bypassing the NPU and
-	 * the Teflon delegate entirely; float_format is then unused. The
-	 * network runs with cpuThreads_ threads, the pack and blend passes
-	 * still with threads_. 3 measured fastest for the int8 model on a Pi 5
-	 * (4 competes with the rest of the camera stack).
-	 */
-	bool cpu_ = false;
-	int cpuThreads_ = 3;
+		/*
+		 * Run the whole model on the CPU, with TFLite's own kernels (and
+		 * its default XNNPACK delegate, where it applies), bypassing the NPU
+		 * and the Teflon delegate entirely; floatFormat is then unused. The
+		 * network runs with cpuThreads threads. 3 measured fastest for the
+		 * int8 model on a Pi 5 (4 competes with the rest of the camera
+		 * stack).
+		 */
+		bool cpu = false;
+		int cpuThreads = 3;
 
-	/*
-	 * Restart from frame 0 when exposure time x analogue gain changes by
-	 * more than this factor (either way) from one frame to the next. The
-	 * network was only trained on fixed-gain sequences.
-	 */
-	double resetRatio_ = 2.0;
+		/*
+		 * Restart from frame 0 when exposure time x analogue gain changes
+		 * by more than this factor (either way) from one frame to the next.
+		 * The network was only trained on fixed-gain sequences.
+		 */
+		double resetRatio = 2.0;
 
-	/*
-	 * Debug only: write the raw frame before and after denoising, for the
-	 * first dumpFrames_ frames after each change of camera mode, to dumpDir_ (as
-	 * <dir>/in_NNNN.raw and out_NNNN.raw, packed uint16, width x height).
-	 * <dir>/frames.txt lists each frame number and whether it restarted
-	 * from frame 0.
-	 */
-	std::string dumpDir_;
-	unsigned int dumpFrames_ = 0;
+		/*
+		 * Debug only: write the raw frame before and after denoising, for
+		 * the first dumpFrames frames after each change of camera mode, to
+		 * dumpDir (as <dir>/in_NNNN.raw and out_NNNN.raw, packed uint16,
+		 * width x height). <dir>/frames.txt lists each frame number and
+		 * whether it restarted from frame 0.
+		 */
+		std::string dumpDir;
+		unsigned int dumpFrames = 0;
+	};
+	Config config_;
+
+	/* Debug only: frames dumped since the last change of camera mode. */
 	unsigned int dumpCount_ = 0;
 
 	/*
@@ -247,28 +251,32 @@ private:
 	std::vector<float> alphaTable_;
 
 	/*
-	 * int8 only: the previous frame's result, square-rooted, in packed
-	 * NHWC order (packH_ x packW_ x 16), as 16-bit fixed point:
-	 * round(prev * 65535).
+	 * The previous frame's result, square-rooted, in packed NHWC order
+	 * (packH_ x packW_ x 16): the recurrent state. Each tile's prev input
+	 * is packed from it, and only the blend writes it, so the tiles'
+	 * buffers are pure inputs, never touched while the NPU may be using
+	 * them. int8 model: prev_, as 16-bit fixed point, round(prev * 65535).
 	 * Never kept as 8-bit: in static areas each frame changes it only
-	 * slightly, and those changes would round away. 16 bits is about 250x
-	 * finer than the network's int8 input, and halves the blend pass's
-	 * memory traffic for prev compared with float (the pass is
-	 * memory-bound). A float model keeps the previous result in its tiles'
-	 * float prev inputs instead (identical where tiles overlap).
+	 * slightly, and those changes would round away; 16 bits is about 250x
+	 * finer than the network's int8 input, and half the memory traffic of
+	 * float. prevQ_ is the same state quantised to the network's int8 prev
+	 * input, made by the blend from the unrounded result and copied into
+	 * each tile by packTile(). Float model: prevFloat_.
 	 */
 	std::vector<uint16_t> prev_;
+	std::vector<int8_t> prevQ_;
+	std::vector<float> prevFloat_;
 	bool firstFrame_ = true;
 
-	/* exposure time x analogue gain of the last frame, for resetRatio_. */
+	/* exposure time x analogue gain of the last frame, for Config::resetRatio. */
 	double lastExposure_ = 0.0;
 
 	/*
 	 * Inference runs on npuThread_, the only thread that calls Invoke()
 	 * once initialise() is done. prepare() packs tiles in raster order and
 	 * publishes how many are ready (packed_); the thread runs them in that
-	 * order and counts them off (done_), and prepare() blends each band of
-	 * rows as soon as the tiles covering it are done. All guarded by
+	 * order and counts them off (done_), and prepare() blends the region
+	 * each tile finishes as soon as it's done. All guarded by
 	 * npuMutex_, with npuCv_ signalled on every change.
 	 */
 	std::thread npuThread_;

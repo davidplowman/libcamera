@@ -73,11 +73,6 @@ endif
 summary({'BSTM NPU denoise' : teflon_path != '' ? teflon_path : false},
         section : 'Raspberry Pi IPA')
 
-# Lets the #pragma omp blocks (denoise_bstm.cpp's pack and blend
-# passes) actually thread.
-openmp_dep = dependency('openmp', required : true)
-rpi_ipa_controller_deps += openmp_dep
-
 rpi_ipa_controller_lib = static_library('rpi_ipa_controller', rpi_ipa_controller_sources,
                                         include_directories : libipa_includes,
                                         dependencies : rpi_ipa_controller_deps)
