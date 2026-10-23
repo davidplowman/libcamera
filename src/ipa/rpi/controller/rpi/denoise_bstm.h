@@ -94,7 +94,12 @@ private:
 	struct Config {
 		int read(const libcamera::ValueNode &params);
 
-		/* The TFLite model (int8 or float32); its size is the tile size. */
+		/*
+		 * The TFLite model (int8 or float32); its size is the tile size.
+		 * The tuning file's "model" is either the path itself or the name
+		 * of another key in the block whose value is the path, so that
+		 * several models can be listed and one chosen by name.
+		 */
 		std::string model;
 
 		/* Path to Mesa's libteflon.so, the TFLite external delegate. */
@@ -111,10 +116,10 @@ private:
 		/*
 		 * How much of the classic PISP hardware denoise stages to keep on
 		 * top of ours. 0 erases a stage's status, so it doesn't run at all
-		 * on a frame we've handled ourselves; otherwise its noise constant
-		 * and slope (for CDN, its threshold, which is linear in them) are
-		 * multiplied by the factor, so 1 leaves the stage as it is. For SDN
-		 * only the first noise constant/slope pair is scaled.
+		 * on a frame we've handled ourselves; otherwise its noise constants
+		 * and slopes (for SDN, both pairs; for CDN, its threshold, which is
+		 * linear in them) are multiplied by the factor, so 1 leaves the
+		 * stage as it is.
 		 */
 		double sdnFactor = 0.0;
 		double tdnFactor = 0.0;

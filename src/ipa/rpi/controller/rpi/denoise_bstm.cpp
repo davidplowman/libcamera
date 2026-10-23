@@ -336,6 +336,9 @@ int DenoiseBstm::read(const libcamera::ValueNode &params)
 int DenoiseBstm::Config::read(const libcamera::ValueNode &params)
 {
 	model = params["model"].get<std::string>("");
+	/* "model" may instead name another key that holds the model's path. */
+	if (!model.empty() && params.contains(model))
+		model = params[model].get<std::string>("");
 	delegate = params["delegate"].get<std::string>(RPI_TEFLON_PATH);
 	floatFormat = params["float_format"].get<std::string>("bf16");
 	sdnFactor = params["sdn_factor"].get<double>(0.0);
@@ -1263,6 +1266,8 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 			       [](SdnStatus &st, double f) {
 				       st.noiseConstant *= f;
 				       st.noiseSlope *= f;
+				       st.noiseConstant2 *= f;
+				       st.noiseSlope2 *= f;
 			       });
 	scaleStatus<TdnStatus>(imageMetadata, "tdn.status", config_.tdnFactor,
 			       [](TdnStatus &st, double f) {
