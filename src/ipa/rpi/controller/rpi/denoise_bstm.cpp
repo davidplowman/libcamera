@@ -2,7 +2,7 @@
 /*
  * Copyright (C) 2026, Raspberry Pi Ltd
  *
- * Recurrent full-frame denoise control algorithm on the BSTM NPU
+ * Recurrent, tiled denoise control algorithm on the BSTM NPU
  */
 
 #include "denoise_bstm.h"
@@ -70,16 +70,16 @@ void dmabufSyncEnd(const SharedFD &fd)
  * network pixel covers one 4x4 raw block. This returns the channel holding
  * raw offset (dx, dy) within that block.
  */
-constexpr unsigned rawToChannel(unsigned dx, unsigned dy)
+constexpr unsigned int rawToChannel(unsigned int dx, unsigned int dy)
 {
 	return 4 * (2 * (dy & 1) + (dx & 1)) + 2 * (dy >> 1) + (dx >> 1);
 }
 
-constexpr unsigned kChannels = 16;
+constexpr unsigned int kChannels = 16;
 
 /* 12-bit raw data, padded with zeros at the bottom: tables are indexed by raw >> 4. */
-constexpr unsigned kRawShift = 4;
-constexpr unsigned kTableSize = 65536 >> kRawShift;
+constexpr unsigned int kRawShift = 4;
+constexpr unsigned int kTableSize = 65536 >> kRawShift;
 
 using Clock = std::chrono::steady_clock;
 
@@ -88,10 +88,6 @@ double msSince(Clock::time_point t)
 	return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
 }
 
-/*
- * The current frame's square root for network pixel x, in channel order,
- * looked up from the raw values (rows[dy] being raw row 4y + dy).
- */
 /*
  * Scale the classic PISP denoise stage's status (tag) by factor, using
  * scale(status, factor), or with a factor of 0 erase it so the stage doesn't
@@ -114,11 +110,87 @@ void scaleStatus(Metadata *imageMetadata, const char *tag, double factor, F scal
 	}
 }
 
-inline void gatherSqrt(uint16_t *const rows[4], unsigned x, const float *table, float *xf)
+/*
+ * Whether two camera modes deliver frames of the same size and layout from
+ * the same sensor pixels, so that the tile layout and recurrent state carry
+ * over. Frame duration and exposure limits don't matter.
+ */
+bool cameraModesMatch(const CameraMode &a, const CameraMode &b)
 {
-	for (unsigned dy = 0; dy < 4; ++dy) {
+	return a.bitdepth == b.bitdepth && a.width == b.width && a.height == b.height &&
+	       a.sensorWidth == b.sensorWidth && a.sensorHeight == b.sensorHeight &&
+	       a.binX == b.binX && a.binY == b.binY && a.cropX == b.cropX && a.cropY == b.cropY &&
+	       a.scaleX == b.scaleX && a.scaleY == b.scaleY && a.transform == b.transform;
+}
+
+/*
+ * Lay tiles of net network pixels along an axis of pack. A frame no larger
+ * than the model is a single tile at 0. Otherwise the fewest tiles that
+ * overlap by at least minOverlap are spread evenly from 0 to pack - net, at
+ * even positions (but the last, which ends flush), so that their
+ * half-resolution grids line up. Each pair of neighbours is cross-faded
+ * linearly across the middle of its overlap, over no more than the distance
+ * between them, so that no position is ever covered by more than two tiles.
+ */
+void layoutAxis(unsigned int pack, unsigned int net, unsigned int minOverlap,
+		DenoiseBstm::TileAxis &axis)
+{
+	axis.origin.clear();
+	axis.rampEnd.clear();
+
+	if (pack <= net) {
+		axis.count = 1;
+		axis.valid = pack;
+		axis.origin.push_back(0);
+	} else {
+		const unsigned int last = pack - net;
+		axis.valid = net;
+		axis.count = (pack - minOverlap + net - minOverlap - 1) / (net - minOverlap);
+		for (;; axis.count++) {
+			axis.origin.clear();
+			for (unsigned int i = 0; i < axis.count; i++) {
+				const double ideal = double(i) * last / (axis.count - 1);
+				const unsigned int even = 2 * static_cast<unsigned int>(std::lround(ideal / 2));
+				axis.origin.push_back(i + 1 == axis.count ? last : even);
+			}
+			bool ok = true;
+			for (unsigned int i = 0; i + 1 < axis.count; i++)
+				ok &= axis.origin[i + 1] - axis.origin[i] <= net - minOverlap;
+			if (ok)
+				break;
+		}
+	}
+
+	axis.tile0.assign(pack, 0);
+	axis.weight0.assign(pack, 1.0f);
+	unsigned int p = 0;
+	for (unsigned int i = 0; i + 1 < axis.count; i++) {
+		const unsigned int end = axis.origin[i] + net; /* tile i ends here */
+		const unsigned int ovl = end - axis.origin[i + 1];
+		unsigned int len = std::min(ovl, axis.origin[i + 1] - axis.origin[i]);
+		const unsigned int start = std::max(axis.origin[i + 1] + (ovl - len) / 2, p);
+		len = std::min(len, end - start);
+		for (; p < start; p++)
+			axis.tile0[p] = i;
+		for (unsigned int j = 0; j < len; j++, p++) {
+			axis.tile0[p] = i;
+			axis.weight0[p] = 1.0f - (j + 0.5f) / len;
+		}
+		axis.rampEnd.push_back(p);
+	}
+	for (; p < pack; p++)
+		axis.tile0[p] = axis.count - 1;
+}
+
+/*
+ * The current frame's square root for network pixel x, in channel order,
+ * looked up from the raw values (rows[dy] being raw row 4y + dy).
+ */
+inline void gatherSqrt(uint16_t *const rows[4], unsigned int x, const float *table, float *xf)
+{
+	for (unsigned int dy = 0; dy < 4; ++dy) {
 		const uint16_t *r = rows[dy] + 4 * x;
-		for (unsigned dx = 0; dx < 4; ++dx)
+		for (unsigned int dx = 0; dx < 4; ++dx)
 			xf[rawToChannel(dx, dy)] = table[r[dx] >> kRawShift];
 	}
 }
@@ -133,29 +205,94 @@ inline void gatherSqrt(uint16_t *const rows[4], unsigned x, const float *table, 
  * dy=0: zip1(c0-3, c4-7) = 0,4,1,5    dy=1: zip1(c8-11, c12-15) = 8,12,9,13
  * dy=2: zip2(c0-3, c4-7) = 2,6,3,7    dy=3: zip2(c8-11, c12-15) = 10,14,11,15
  */
-inline void writeRaw(uint16_t *const rows[4], unsigned x, const float32x4x4_t &out)
+inline void writeRaw(uint16_t *const rows[4], unsigned int x, const float32x4x4_t &out)
 {
 	const float32x4_t vRawMax = vdupq_n_f32(65535.0f);
 	float32x4_t lin[4];
-	for (unsigned i = 0; i < 4; ++i)
+	for (unsigned int i = 0; i < 4; ++i)
 		lin[i] = vmulq_f32(out.val[i], vmulq_f32(out.val[i], vRawMax));
 	const float32x4_t rowv[4] = { vzip1q_f32(lin[0], lin[1]), vzip1q_f32(lin[2], lin[3]),
 				      vzip2q_f32(lin[0], lin[1]), vzip2q_f32(lin[2], lin[3]) };
-	for (unsigned dy = 0; dy < 4; ++dy)
+	for (unsigned int dy = 0; dy < 4; ++dy)
 		vst1_u16(rows[dy] + 4 * x, vqmovn_u32(vcvtaq_u32_f32(rowv[dy])));
 }
-#else
-inline void writeRaw(uint16_t *const rows[4], unsigned x, const float *out)
+
+/*
+ * An int8 residual's 16 channels minus its zero point (within [-255, 255]:
+ * exact in int16), as float.
+ */
+inline float32x4x4_t residualMinusZp(const int8_t *rq, int16x8_t vRZp)
 {
-	for (unsigned dy = 0; dy < 4; ++dy) {
+	const int8x16_t q = vld1q_s8(rq);
+	const int16x8_t lo = vsubq_s16(vmovl_s8(vget_low_s8(q)), vRZp);
+	const int16x8_t hi = vsubq_s16(vmovl_s8(vget_high_s8(q)), vRZp);
+	auto cvt = [](int16x4_t v) { return vcvtq_f32_s32(vmovl_s16(v)); };
+	return { cvt(vget_low_s16(lo)), cvt(vget_high_s16(lo)),
+		 cvt(vget_low_s16(hi)), cvt(vget_high_s16(hi)) };
+}
+
+/* prev_'s 16-bit fixed point, round(prev * 65535), to float. */
+inline float32x4x4_t loadPrev(const uint16_t *p, float32x4_t vInvMax)
+{
+	const uint16x8x2_t pu = vld1q_u16_x2(p);
+	auto cvt = [&](uint16x4_t v) { return vmulq_f32(vcvtq_f32_u32(vmovl_u16(v)), vInvMax); };
+	return { cvt(vget_low_u16(pu.val[0])), cvt(vget_high_u16(pu.val[0])),
+		 cvt(vget_low_u16(pu.val[1])), cvt(vget_high_u16(pu.val[1])) };
+}
+
+/* out is in [0, 1], so no clamp is needed (see writeRaw()). */
+inline void storePrev(uint16_t *p, const float32x4x4_t &out, float32x4_t vRawMax)
+{
+	uint16x4_t pu[4];
+	for (unsigned int i = 0; i < 4; ++i)
+		pu[i] = vqmovn_u32(vcvtaq_u32_f32(vmulq_f32(out.val[i], vRawMax)));
+	vst1q_u16_x2(p, uint16x8x2_t{ vcombine_u16(pu[0], pu[1]), vcombine_u16(pu[2], pu[3]) });
+}
+
+/*
+ * The next frame's int8 prev input, quantised as TFLite would: round half
+ * away from zero (FCVTAS), plus the zero point, saturated to int8.
+ */
+inline int8x16_t quantisePrev(const float32x4x4_t &out, float32x4_t vInvScale, int32x4_t vZp)
+{
+	int16x4_t q16[4];
+	for (unsigned int i = 0; i < 4; ++i)
+		q16[i] = vqmovn_s32(vqaddq_s32(vcvtaq_s32_f32(vmulq_f32(out.val[i], vInvScale)), vZp));
+	return vcombine_s8(vqmovn_s16(vcombine_s16(q16[0], q16[1])),
+			   vqmovn_s16(vcombine_s16(q16[2], q16[3])));
+}
+#else
+inline void writeRaw(uint16_t *const rows[4], unsigned int x, const float *out)
+{
+	for (unsigned int dy = 0; dy < 4; ++dy) {
 		uint16_t *r = rows[dy] + 4 * x;
-		for (unsigned dx = 0; dx < 4; ++dx) {
+		for (unsigned int dx = 0; dx < 4; ++dx) {
 			const float o = out[rawToChannel(dx, dy)];
 			r[dx] = uint16_t(std::lround(std::min(o * (o * 65535.0f), 65535.0f)));
 		}
 	}
 }
 #endif
+
+/*
+ * The tiles covering one network pixel along one axis: one, or two (the
+ * second being the next tile) where neighbours are cross-faded.
+ */
+struct Cover {
+	unsigned int n;
+	unsigned int tile[2];
+	unsigned int local[2]; /* position within each tile */
+	float weight[2];
+};
+
+inline Cover cover(const DenoiseBstm::TileAxis &axis, unsigned int p)
+{
+	const unsigned int t = axis.tile0[p];
+	const float w = axis.weight0[p];
+	if (w < 1.0f)
+		return { 2, { t, t + 1 }, { p - axis.origin[t], p - axis.origin[t + 1] }, { w, 1.0f - w } };
+	return { 1, { t, t }, { p - axis.origin[t], 0 }, { 1.0f, 0.0f } };
+}
 
 } /* namespace */
 
@@ -166,6 +303,15 @@ DenoiseBstm::DenoiseBstm(Controller *controller)
 
 DenoiseBstm::~DenoiseBstm()
 {
+	if (npuThread_.joinable()) {
+		{
+			std::lock_guard<std::mutex> lock(npuMutex_);
+			npuExit_ = true;
+		}
+		npuCv_.notify_all();
+		npuThread_.join();
+	}
+
 	/* The interpreter still references the delegate until it's gone. */
 	interpreter_.reset();
 	if (tfDelegate_)
@@ -187,25 +333,18 @@ int DenoiseBstm::read(const libcamera::ValueNode &params)
 	cdnFactor_ = params["cdn_factor"].get<double>(0.0);
 
 	threads_ = params["threads"].get<int>(2);
+	minOverlap_ = params["min_overlap"].get<unsigned int>(4);
 	cpu_ = params["cpu"].get<bool>(false);
 	cpuThreads_ = params["cpu_threads"].get<int>(3);
 	demo_ = params["demo"].get<bool>(false);
 	resetRatio_ = params["reset_ratio"].get<double>(2.0);
 
 	dumpDir_ = params["dump_dir"].get<std::string>("");
-	dumpFrames_ = params["dump_frames"].get<unsigned>(0);
+	dumpFrames_ = params["dump_frames"].get<unsigned int>(0);
 
 	if (model_.empty()) {
 		LOG(RPiDenoiseBstm, Error) << "\"model\" must be supplied";
 		return -EINVAL;
-	}
-
-	for (const char *stage : { "sdn", "tdn", "cdn" }) {
-		const std::string old = std::string(stage) + "_disable";
-		if (params.contains(old))
-			LOG(RPiDenoiseBstm, Warning)
-				<< "\"" << old << "\" is no longer supported and is ignored; use \""
-				<< stage << "_factor\" (0 disables the stage, 1 leaves it as it is)";
 	}
 
 	if (sdnFactor_ < 0.0 || tdnFactor_ < 0.0 || cdnFactor_ < 0.0) {
@@ -234,7 +373,7 @@ int DenoiseBstm::read(const libcamera::ValueNode &params)
  * which are returned in scale and zp.
  */
 bool DenoiseBstm::checkTensor(const TfLiteTensor *t, const char *what, int channels,
-				      bool &isInt8, float &scale, int &zp)
+			      bool &isInt8, float &scale, int &zp)
 {
 	if (!t || !t->dims || t->dims->size != 4 || t->dims->data[0] != 1 ||
 	    t->dims->data[3] != channels) {
@@ -296,8 +435,12 @@ void DenoiseBstm::initialise()
 		LOG(RPiDenoiseBstm, Error) << "Failed to build TFLite interpreter for " << model_;
 		return;
 	}
-	/* This also sets the threads of TFLite's default CPU (XNNPACK) delegate. */
-	interpreter_->SetNumThreads(cpu_ ? cpuThreads_ : threads_);
+	/*
+	 * Threads for TFLite's CPU kernels (and its default XNNPACK delegate).
+	 * On the NPU the whole graph is one Teflon delegate node, which runs on
+	 * the calling thread, so the number makes no difference there.
+	 */
+	interpreter_->SetNumThreads(cpu_ ? cpuThreads_ : 1);
 
 	if (!cpu_) {
 		/*
@@ -334,7 +477,7 @@ void DenoiseBstm::initialise()
 	 * With cpu_, any delegate nodes are TFLite's own default CPU delegate
 	 * (XNNPACK), applied by AllocateTensors(); otherwise they're the NPU.
 	 */
-	unsigned delegated = 0;
+	unsigned int delegated = 0;
 	const std::vector<int> &plan = interpreter_->execution_plan();
 	for (int node : plan) {
 		const auto *nr = interpreter_->node_and_registration(node);
@@ -395,11 +538,19 @@ void DenoiseBstm::initialise()
 	netH_ = x->dims->data[1];
 	netW_ = x->dims->data[2];
 	for (const TfLiteTensor *t : { prev, r, a }) {
-		if (unsigned(t->dims->data[1]) != netH_ || unsigned(t->dims->data[2]) != netW_) {
+		if (static_cast<unsigned int>(t->dims->data[1]) != netH_ ||
+		    static_cast<unsigned int>(t->dims->data[2]) != netW_) {
 			LOG(RPiDenoiseBstm, Error)
 				<< model_ << ": all inputs and outputs must be the same size";
 			return;
 		}
+	}
+
+	if (2 * minOverlap_ >= std::min(netW_, netH_)) {
+		LOG(RPiDenoiseBstm, Error)
+			<< "\"min_overlap\" (" << minOverlap_ << ") must be less than half the model's size ("
+			<< netW_ << "x" << netH_ << ")";
+		return;
 	}
 
 	buildTables();
@@ -420,6 +571,7 @@ void DenoiseBstm::initialise()
 			<< ", " << prevZp_ << "), r (" << rScale_ << ", " << rZp_ << "), a (" << aScale_
 			<< ", " << aZp_ << ")";
 
+	npuThread_ = std::thread(&DenoiseBstm::npuLoop, this);
 	init_ = true;
 }
 
@@ -433,7 +585,7 @@ void DenoiseBstm::initialise()
 void DenoiseBstm::buildTables()
 {
 	xfTable_.resize(kTableSize);
-	for (unsigned i = 0; i < kTableSize; i++)
+	for (unsigned int i = 0; i < kTableSize; i++)
 		xfTable_[i] = float(std::sqrt(double(i << kRawShift) / 65535.0));
 
 	if (isFloat_) {
@@ -443,7 +595,7 @@ void DenoiseBstm::buildTables()
 	}
 
 	xqTable_.resize(kTableSize);
-	for (unsigned i = 0; i < kTableSize; i++) {
+	for (unsigned int i = 0; i < kTableSize; i++) {
 		const double v = std::sqrt(double(i << kRawShift) / 65535.0);
 		xqTable_[i] = int8_t(std::clamp(int(std::lround(v / xScale_)) + xZp_, -128, 127));
 	}
@@ -455,6 +607,18 @@ void DenoiseBstm::buildTables()
 
 void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Metadata *metadata)
 {
+	/*
+	 * Restarting the camera in the same mode keeps the tile layout, the
+	 * buffers and the recurrent state (checkContinuity() still restarts
+	 * from frame 0 on a large jump in exposure). active_ is only set once
+	 * a mode has been set up, so the first call always sets up.
+	 */
+	if (active_ && cameraModesMatch(cameraMode, mode_)) {
+		LOG(RPiDenoiseBstm, Debug) << "Camera mode unchanged: keeping the temporal state";
+		return;
+	}
+
+	mode_ = cameraMode;
 	width_ = cameraMode.width;
 	height_ = cameraMode.height;
 	active_ = false;
@@ -462,49 +626,74 @@ void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 	if (!init_)
 		return;
 
-	/*
-	 * One network pixel per 4x4 raw block. The model's size is fixed, so
-	 * a smaller frame is padded (with the inputs' encoding of zero) and a
-	 * larger one cropped, the rest being left untouched.
-	 */
-	unsigned packW = width_ / 4;
-	unsigned packH = height_ / 4;
-	if (packW > netW_ || packH > netH_) {
-		LOG(RPiDenoiseBstm, Error)
-			<< "Bayer " << width_ << "x" << height_ << " (network " << packW << "x" << packH
-			<< ") exceeds this network's size " << netW_ << "x" << netH_
-			<< " -- cropping to fit";
-		packW = std::min(packW, netW_);
-		packH = std::min(packH, netH_);
-	}
-	packW_ = packW;
-	packH_ = packH;
+	/* One network pixel per 4x4 raw block; tiled when larger than the model. */
+	packW_ = width_ / 4;
+	packH_ = height_ / 4;
 	if (!packW_ || !packH_)
 		return;
+
+	layoutAxis(packW_, netW_, minOverlap_, tilesX_);
+	layoutAxis(packH_, netH_, minOverlap_, tilesY_);
+
+	/* Every tile's x, prev, r and a, each 64-byte aligned. */
+	auto align = [](size_t n) { return (n + 63) & ~size_t(63); };
+	const size_t elem = isFloat_ ? sizeof(float) : sizeof(int8_t);
+	const size_t n16 = size_t(netW_) * netH_ * kChannels * elem;
+	const size_t n1 = size_t(netW_) * netH_ * elem;
+	offX_ = 0;
+	offPrev_ = align(n16);
+	offR_ = offPrev_ + align(n16);
+	offA_ = offR_ + align(n16);
+	tileBytes_ = offA_ + align(n1);
+	const size_t bytes = tileBytes_ * tiles();
+	if (bytes != tileBuffersSize_) {
+		tileBuffers_.reset(static_cast<uint8_t *>(aligned_alloc(64, bytes)));
+		tileBuffersSize_ = tileBuffers_ ? bytes : 0;
+		if (!tileBuffers_) {
+			LOG(RPiDenoiseBstm, Error) << "Failed to allocate " << bytes << " bytes of tile buffers";
+			return;
+		}
+	}
+
+	/*
+	 * Only the part of each tile backed by the frame is ever packed, so
+	 * where the frame is smaller than the model, the rest keeps the
+	 * encoding of zero filled here for as long as this mode lasts.
+	 */
+	const size_t n = size_t(netW_) * netH_ * kChannels;
+	for (unsigned int k = 0; k < tiles(); k++) {
+		if (isFloat_)
+			std::fill(tileX<float>(k), tileX<float>(k) + n, 0.0f);
+		else
+			std::fill(tileX<int8_t>(k), tileX<int8_t>(k) + n, int8_t(xZp_));
+	}
 
 	if (isFloat_)
 		prev_.clear();
 	else
 		prev_.assign(size_t(packW_) * packH_ * kChannels, 0);
 
-	/*
-	 * TFLite never writes its input tensors, so whatever lies outside the
-	 * packed region stays as filled here for as long as this mode lasts.
-	 */
-	const size_t n = size_t(netW_) * netH_ * kChannels;
-	TfLiteTensor *x = interpreter_->tensor(inX_);
-	if (isFloat_)
-		std::fill(x->data.f, x->data.f + n, 0.0f);
-	else
-		std::fill(x->data.int8, x->data.int8 + n, int8_t(xZp_));
-
 	dumpCount_ = 0;
 	active_ = true;
 	reset();
 
+	auto overlaps = [](const TileAxis &axis, unsigned int net) {
+		if (axis.count < 2)
+			return std::string("-");
+		unsigned int lo = net, hi = 0;
+		for (unsigned int i = 0; i + 1 < axis.count; i++) {
+			const unsigned int o = axis.origin[i] + net - axis.origin[i + 1];
+			lo = std::min(lo, o);
+			hi = std::max(hi, o);
+		}
+		return lo == hi ? std::to_string(lo) : std::to_string(lo) + "-" + std::to_string(hi);
+	};
 	LOG(RPiDenoiseBstm, Info)
-		<< "Bayer " << width_ << "x" << height_ << " -> " << kChannels << "x" << netH_
-		<< "x" << netW_ << " (pack " << packW_ << "x" << packH_ << ")";
+		<< "Bayer " << width_ << "x" << height_ << " (" << packW_ << "x" << packH_
+		<< " network pixels) -> " << tilesX_.count << "x" << tilesY_.count << " tiles of "
+		<< netW_ << "x" << netH_ << ", overlaps " << overlaps(tilesX_, netW_) << " x "
+		<< overlaps(tilesY_, netH_) << " (minimum " << minOverlap_ << "), "
+		<< bytes / 1024 << " KiB of tile buffers";
 }
 
 void DenoiseBstm::setMode([[maybe_unused]] DenoiseMode mode)
@@ -512,17 +701,18 @@ void DenoiseBstm::setMode([[maybe_unused]] DenoiseMode mode)
 }
 
 /*
- * Restart from frame 0: the network's prev input becomes real zeros (for
+ * Restart from frame 0: every tile's prev input becomes real zeros (for
  * int8, its zero point, -128, not int8 0), and the next blend ignores alpha.
  */
 void DenoiseBstm::reset()
 {
 	const size_t n = size_t(netW_) * netH_ * kChannels;
-	TfLiteTensor *prev = interpreter_->tensor(inPrev_);
-	if (isFloat_)
-		std::fill(prev->data.f, prev->data.f + n, 0.0f);
-	else
-		std::fill(prev->data.int8, prev->data.int8 + n, int8_t(prevZp_));
+	for (unsigned int k = 0; tileBuffers_ && k < tiles(); k++) {
+		if (isFloat_)
+			std::fill(tilePrev<float>(k), tilePrev<float>(k) + n, 0.0f);
+		else
+			std::fill(tilePrev<int8_t>(k), tilePrev<int8_t>(k) + n, int8_t(prevZp_));
+	}
 
 	firstFrame_ = true;
 	lastExposure_ = 0.0;
@@ -559,36 +749,100 @@ bool DenoiseBstm::checkContinuity(Metadata *imageMetadata)
 }
 
 /*
- * Pack the raw Bayer frame into the network's x input: network pixel (x,y)
- * covers raw rows [4y,4y+4) and columns [4x,4x+4), raw offset (dx,dy) going
- * to channel rawToChannel(dx,dy), each sample being its square root from
- * table: quantised (xqTable_) for an int8 model, or in float (xfTable_).
+ * The inference thread: run each tile as soon as it's packed, in order,
+ * pointing the interpreter's input and output tensors at its buffers first.
+ * After a failure, stop until the next frame.
+ */
+void DenoiseBstm::npuLoop()
+{
+	std::unique_lock<std::mutex> lock(npuMutex_);
+	for (;;) {
+		npuCv_.wait(lock, [this] { return npuExit_ || (!npuError_ && done_ < packed_); });
+		if (npuExit_)
+			return;
+		const unsigned int k = done_;
+		lock.unlock();
+
+		const Clock::time_point t0 = Clock::now();
+		const int idx[4] = { inX_, inPrev_, outR_, outA_ };
+		uint8_t *const buf[4] = { tileX<uint8_t>(k), tilePrev<uint8_t>(k), tileR<uint8_t>(k),
+					  tileA<uint8_t>(k) };
+		for (unsigned int i = 0; i < 4; i++)
+			interpreter_->tensor(idx[i])->data.raw = reinterpret_cast<char *>(buf[i]);
+		const bool ok = interpreter_->Invoke() == kTfLiteOk;
+		const double ms = msSince(t0);
+
+		lock.lock();
+		npuMs_ += ms;
+		if (ok)
+			done_++;
+		else
+			npuError_ = true;
+		npuCv_.notify_all();
+	}
+}
+
+void DenoiseBstm::startFrame([[maybe_unused]] unsigned int tiles)
+{
+	std::lock_guard<std::mutex> lock(npuMutex_);
+	packed_ = 0;
+	done_ = 0;
+	npuError_ = false;
+	npuMs_ = 0.0;
+}
+
+void DenoiseBstm::publishPacked(unsigned int packed)
+{
+	{
+		std::lock_guard<std::mutex> lock(npuMutex_);
+		packed_ = packed;
+	}
+	npuCv_.notify_all();
+}
+
+/* Wait until the first tiles tiles are done; false if inference failed. */
+bool DenoiseBstm::waitDone(unsigned int tiles)
+{
+	std::unique_lock<std::mutex> lock(npuMutex_);
+	npuCv_.wait(lock, [&] { return npuError_ || done_ >= tiles; });
+	return !npuError_;
+}
+
+/*
+ * Pack tile k's part of the raw Bayer frame into its x input: network pixel
+ * (x,y) of a tile at (ox,oy) covers raw rows [4(oy+y),4(oy+y)+4) and columns
+ * [4(ox+x),4(ox+x)+4), raw offset (dx,dy) going to channel rawToChannel(dx,dy),
+ * each sample being its square root from table: quantised (xqTable_) for an
+ * int8 model, or in float (xfTable_).
  *
  * The 16 scalar table lookups per network pixel make this compute-bound
- * rather than memory-bound, so it is threaded (2.1 ms -> 1.4 ms with 2
- * threads on a Pi 5).
+ * rather than memory-bound, so it is threaded (2.1 ms -> 1.4 ms for a whole
+ * frame with 2 threads on a Pi 5).
  */
 template<typename T>
-void DenoiseBstm::packInput(const uint16_t *bayer16, unsigned stridePx, const T *table,
-				    T *in)
+void DenoiseBstm::packTile(unsigned int k, const uint16_t *bayer16, unsigned int stridePx,
+			   const T *table)
 {
-	const unsigned netW = netW_, packW = packW_, packH = packH_;
+	const unsigned int netW = netW_, validW = tilesX_.valid, validH = tilesY_.valid;
+	const unsigned int ox = tilesX_.origin[k % tilesX_.count];
+	const unsigned int oy = tilesY_.origin[k / tilesX_.count];
+	T *in = tileX<T>(k);
 
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(threads_) schedule(static)
 #endif
-	for (int y_ = 0; y_ < int(packH); ++y_) {
-		const unsigned y = unsigned(y_);
+	for (int y_ = 0; y_ < int(validH); ++y_) {
+		const unsigned int y = static_cast<unsigned int>(y_);
 		T *d = in + size_t(y) * netW * kChannels;
 		const uint16_t *rows[4];
-		for (unsigned dy = 0; dy < 4; ++dy)
-			rows[dy] = bayer16 + size_t(4 * y + dy) * stridePx;
+		for (unsigned int dy = 0; dy < 4; ++dy)
+			rows[dy] = bayer16 + size_t(4 * (oy + y) + dy) * stridePx + 4 * ox;
 
-		for (unsigned x = 0; x < packW; ++x) {
+		for (unsigned int x = 0; x < validW; ++x) {
 			T *p = d + size_t(x) * kChannels;
-			for (unsigned dy = 0; dy < 4; ++dy) {
+			for (unsigned int dy = 0; dy < 4; ++dy) {
 				const uint16_t *r = rows[dy] + 4 * x;
-				for (unsigned dx = 0; dx < 4; ++dx)
+				for (unsigned int dx = 0; dx < 4; ++dx)
 					p[rawToChannel(dx, dy)] = table[r[dx] >> kRawShift];
 			}
 		}
@@ -596,34 +850,35 @@ void DenoiseBstm::packInput(const uint16_t *bayer16, unsigned stridePx, const T 
 }
 
 /*
- * Complete the frame from the network's outputs, all in float and in
+ * Complete frame rows [y0, y1) from the tiles' outputs, all in float and in
  * square-root space, for each network pixel and channel k:
  *
- *   s    = clamp(xf + r, 0, 1)
- *   out  = s                                   on the first frame
- *   out  = prev + alpha * (s - prev)           otherwise
+ *   s_t  = clamp(xf + r_t, 0, 1)                       for each covering tile t
+ *   out  = sum_t w_t s_t                               on the first frame
+ *   out  = prev + sum_t w_t alpha_t (s_t - prev)       otherwise
  *
  * with xf the current frame's square root (looked up again from the raw
- * values, which are still in the buffer), and alpha = sigmoid(a), one per
- * network pixel. out is kept for the next frame, and written back over the
- * raw buffer squared, as round(out^2 * 65535).
+ * values, which are still in the buffer), alpha_t = sigmoid(a_t), one per
+ * network pixel, and w_t the tiles' cross-fade weights, which sum to 1. A
+ * pixel covered by a single tile (weight 1, and all of them when the model
+ * is as large as the frame) takes exactly the arithmetic of a single
+ * prev + alpha * (s - prev). out is kept for the next frame, and written
+ * back over the raw buffer squared, as round(out^2 * 65535).
  *
  * int8 model: r and a are dequantised, (q - zero point) * scale, and alpha
  * comes from alphaTable_. out is kept in prev_ (as 16-bit fixed point,
- * round(out * 65535)), and written quantised to the network's prev input
- * ready for the next frame.
+ * round(out * 65535)), and written quantised to the prev input of every tile
+ * covering the pixel, ready for the next frame.
  */
-void DenoiseBstm::blendInt8(uint16_t *bayer16, unsigned stridePx)
+void DenoiseBstm::blendBandInt8(uint16_t *bayer16, unsigned int stridePx, unsigned int y0,
+				unsigned int y1)
 {
-	const unsigned netW = netW_, packW = packW_, packH = packH_;
+	const unsigned int netW = netW_, packW = packW_, nx = tilesX_.count;
 	/* demo_: write back the right half only (but update everything else). */
-	const unsigned xStart = demo_ ? packW / 2 : 0;
+	const unsigned int xStart = demo_ ? packW / 2 : 0;
 	const bool first = firstFrame_;
 	const float *xfTable = xfTable_.data();
 	const float *alphaTable = alphaTable_.data();
-	const int8_t *rOut = interpreter_->tensor(outR_)->data.int8;
-	const int8_t *aOut = interpreter_->tensor(outA_)->data.int8;
-	int8_t *prevIn = interpreter_->tensor(inPrev_)->data.int8;
 	uint16_t *prevBuf = prev_.data();
 	const float rScale = rScale_;
 	const int rZp = rZp_;
@@ -644,79 +899,89 @@ void DenoiseBstm::blendInt8(uint16_t *bayer16, unsigned stridePx)
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(threads_) schedule(static)
 #endif
-	for (int y_ = 0; y_ < int(packH); ++y_) {
-		const unsigned y = unsigned(y_);
-		const int8_t *rRow = rOut + size_t(y) * netW * kChannels;
-		const int8_t *aRow = aOut + size_t(y) * netW;
-		int8_t *pqRow = prevIn + size_t(y) * netW * kChannels;
+	for (int y_ = int(y0); y_ < int(y1); ++y_) {
+		const unsigned int y = static_cast<unsigned int>(y_);
+		const Cover cy = cover(tilesY_, y);
 		uint16_t *pRow = prevBuf + size_t(y) * packW * kChannels;
 		uint16_t *rows[4];
-		for (unsigned dy = 0; dy < 4; ++dy)
+		for (unsigned int dy = 0; dy < 4; ++dy)
 			rows[dy] = bayer16 + size_t(4 * y + dy) * stridePx;
 
-		for (unsigned x = 0; x < packW; ++x) {
+		for (unsigned int x = 0; x < packW; ++x) {
 			alignas(16) float xf[kChannels];
 			gatherSqrt(rows, x, xfTable, xf);
-			const float alpha = alphaTable[aRow[x] + 128];
 			uint16_t *p = pRow + size_t(x) * kChannels;
-			int8_t *pq = pqRow + size_t(x) * kChannels;
+			const Cover cx = cover(tilesX_, x);
+
+			/* The covering tiles (1, 2 or 4), their weights and pixel offsets. */
+			unsigned int nt = 0, tile[4];
+			size_t local[4];
+			float weight[4];
+			for (unsigned int i = 0; i < cy.n; i++) {
+				for (unsigned int j = 0; j < cx.n; j++, nt++) {
+					tile[nt] = cy.tile[i] * nx + cx.tile[j];
+					local[nt] = size_t(cy.local[i]) * netW + cx.local[j];
+					weight[nt] = cy.weight[i] * cx.weight[j];
+				}
+			}
 
 #if defined(__ARM_NEON)
-			/* r - zr is within [-255, 255]: exact in int16. */
-			const int8x16_t rq = vld1q_s8(rRow + size_t(x) * kChannels);
-			const int16x8_t rLo = vsubq_s16(vmovl_s8(vget_low_s8(rq)), vRZp);
-			const int16x8_t rHi = vsubq_s16(vmovl_s8(vget_high_s8(rq)), vRZp);
-			auto cvt = [](int16x4_t v) { return vcvtq_f32_s32(vmovl_s16(v)); };
-			const float32x4_t rf[4] = { cvt(vget_low_s16(rLo)), cvt(vget_high_s16(rLo)),
-						    cvt(vget_low_s16(rHi)), cvt(vget_high_s16(rHi)) };
 			const float32x4x4_t xv = vld1q_f32_x4(xf);
 			float32x4x4_t pv;
-			if (!first) {
-				const uint16x8x2_t pu = vld1q_u16_x2(p);
-				auto cvtPrev = [&](uint16x4_t v) {
-					return vmulq_f32(vcvtq_f32_u32(vmovl_u16(v)), vInvMax);
-				};
-				pv = { cvtPrev(vget_low_u16(pu.val[0])), cvtPrev(vget_high_u16(pu.val[0])),
-				       cvtPrev(vget_low_u16(pu.val[1])), cvtPrev(vget_high_u16(pu.val[1])) };
-			}
-			const float32x4_t vAlpha = vdupq_n_f32(alpha);
+			if (!first)
+				pv = loadPrev(p, vInvMax);
 
 			float32x4x4_t out;
-			for (unsigned i = 0; i < 4; ++i) {
-				/* The residual's dequantising multiply is fused with the skip add. */
-				float32x4_t s = vfmaq_f32(xv.val[i], rf[i], vRScale);
-				s = vminq_f32(vmaxq_f32(s, vZero), vOne);
-				out.val[i] = first ? s
-						   : vfmaq_f32(pv.val[i], vAlpha, vsubq_f32(s, pv.val[i]));
+			if (nt == 1) {
+				const float32x4x4_t rf = residualMinusZp(tileR<int8_t>(tile[0]) + local[0] * kChannels, vRZp);
+				const float32x4_t vAlpha = vdupq_n_f32(alphaTable[tileA<int8_t>(tile[0])[local[0]] + 128]);
+				for (unsigned int i = 0; i < 4; ++i) {
+					/* The residual's dequantising multiply is fused with the skip add. */
+					float32x4_t s = vfmaq_f32(xv.val[i], rf.val[i], vRScale);
+					s = vminq_f32(vmaxq_f32(s, vZero), vOne);
+					out.val[i] = first ? s
+							   : vfmaq_f32(pv.val[i], vAlpha, vsubq_f32(s, pv.val[i]));
+				}
+			} else {
+				float32x4x4_t acc = { vZero, vZero, vZero, vZero };
+				for (unsigned int t = 0; t < nt; t++) {
+					const float32x4x4_t rf = residualMinusZp(tileR<int8_t>(tile[t]) + local[t] * kChannels, vRZp);
+					const float alpha = alphaTable[tileA<int8_t>(tile[t])[local[t]] + 128];
+					const float32x4_t vW = vdupq_n_f32(first ? weight[t] : weight[t] * alpha);
+					for (unsigned int i = 0; i < 4; ++i) {
+						float32x4_t s = vfmaq_f32(xv.val[i], rf.val[i], vRScale);
+						s = vminq_f32(vmaxq_f32(s, vZero), vOne);
+						acc.val[i] = vfmaq_f32(acc.val[i], vW, first ? s : vsubq_f32(s, pv.val[i]));
+					}
+				}
+				for (unsigned int i = 0; i < 4; ++i)
+					out.val[i] = first ? acc.val[i] : vaddq_f32(pv.val[i], acc.val[i]);
 			}
-			/* Kept to 16 bits: out is in [0, 1], so no clamp is needed (see writeRaw()). */
-			uint16x4_t pu[4];
-			for (unsigned i = 0; i < 4; ++i)
-				pu[i] = vqmovn_u32(vcvtaq_u32_f32(vmulq_f32(out.val[i], vRawMax)));
-			vst1q_u16_x2(p, uint16x8x2_t{ vcombine_u16(pu[0], pu[1]), vcombine_u16(pu[2], pu[3]) });
+			storePrev(p, out, vRawMax);
 
-			/*
-			 * The next frame's prev input, quantised as TFLite would:
-			 * round half away from zero (FCVTAS), plus the zero point,
-			 * saturated to int8.
-			 */
-			int16x4_t q16[4];
-			for (unsigned i = 0; i < 4; ++i)
-				q16[i] = vqmovn_s32(vqaddq_s32(vcvtaq_s32_f32(vmulq_f32(out.val[i], vPrevInvScale)),
-							       vPrevZp));
-			vst1q_s8(pq, vcombine_s8(vqmovn_s16(vcombine_s16(q16[0], q16[1])),
-						 vqmovn_s16(vcombine_s16(q16[2], q16[3]))));
+			const int8x16_t q = quantisePrev(out, vPrevInvScale, vPrevZp);
+			for (unsigned int t = 0; t < nt; t++)
+				vst1q_s8(tilePrev<int8_t>(tile[t]) + local[t] * kChannels, q);
 #else
-			const int8_t *rq = rRow + size_t(x) * kChannels;
 			float out[kChannels];
-			for (unsigned k = 0; k < kChannels; ++k) {
-				float s = std::fma(float(int(rq[k]) - rZp), rScale, xf[k]);
-				s = std::clamp(s, 0.0f, 1.0f);
+			for (unsigned int k = 0; k < kChannels; ++k) {
 				const float pk = float(p[k]) * (1.0f / 65535.0f);
-				out[k] = first ? s : std::fma(alpha, s - pk, pk);
+				float acc = 0.0f;
+				for (unsigned int t = 0; t < nt; t++) {
+					const int8_t *rq = tileR<int8_t>(tile[t]) + local[t] * kChannels;
+					const float alpha = alphaTable[tileA<int8_t>(tile[t])[local[t]] + 128];
+					const float s = std::clamp(std::fma(float(int(rq[k]) - rZp), rScale, xf[k]), 0.0f, 1.0f);
+					if (nt == 1)
+						acc = first ? s : std::fma(alpha, s - pk, pk);
+					else
+						acc = std::fma(first ? weight[t] : weight[t] * alpha, first ? s : s - pk, acc);
+				}
+				out[k] = nt == 1 || first ? acc : pk + acc;
 				p[k] = uint16_t(std::lround(out[k] * 65535.0f));
-				pq[k] = int8_t(std::clamp(int(std::lround(out[k] * prevInvScale)) + prevZp,
-							  -128, 127));
+				const int8_t q = int8_t(std::clamp(int(std::lround(out[k] * prevInvScale)) + prevZp,
+								   -128, 127));
+				for (unsigned int t = 0; t < nt; t++)
+					tilePrev<int8_t>(tile[t])[local[t] * kChannels + k] = q;
 			}
 #endif
 
@@ -727,22 +992,21 @@ void DenoiseBstm::blendInt8(uint16_t *bayer16, unsigned stridePx)
 }
 
 /*
- * As blendInt8(), for a float model: r and a need no dequantising, alpha is
- * computed directly (one exp per network pixel), and out is kept in the
- * network's float prev input itself, which is read back next frame. TFLite
- * never writes its inputs, and the Teflon delegate converts them to
- * bf16/fp16 without touching the originals.
+ * As blendBandInt8(), for a float model: r and a need no dequantising, alpha
+ * is computed directly (one exp per network pixel and tile), and out is kept
+ * in the covering tiles' float prev inputs themselves (identical copies,
+ * read from the first), which are read back next frame. TFLite never writes
+ * its inputs, and the Teflon delegate converts them to bf16/fp16 without
+ * touching the originals.
  */
-void DenoiseBstm::blendFloat(uint16_t *bayer16, unsigned stridePx)
+void DenoiseBstm::blendBandFloat(uint16_t *bayer16, unsigned int stridePx, unsigned int y0,
+				 unsigned int y1)
 {
-	const unsigned netW = netW_, packW = packW_, packH = packH_;
+	const unsigned int netW = netW_, packW = packW_, nx = tilesX_.count;
 	/* demo_: write back the right half only (but update everything else). */
-	const unsigned xStart = demo_ ? packW / 2 : 0;
+	const unsigned int xStart = demo_ ? packW / 2 : 0;
 	const bool first = firstFrame_;
 	const float *xfTable = xfTable_.data();
-	const float *rOut = interpreter_->tensor(outR_)->data.f;
-	const float *aOut = interpreter_->tensor(outA_)->data.f;
-	float *prevIn = interpreter_->tensor(inPrev_)->data.f;
 
 #if defined(__ARM_NEON)
 	const float32x4_t vZero = vdupq_n_f32(0.0f);
@@ -752,45 +1016,83 @@ void DenoiseBstm::blendFloat(uint16_t *bayer16, unsigned stridePx)
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(threads_) schedule(static)
 #endif
-	for (int y_ = 0; y_ < int(packH); ++y_) {
-		const unsigned y = unsigned(y_);
-		const float *rRow = rOut + size_t(y) * netW * kChannels;
-		const float *aRow = aOut + size_t(y) * netW;
-		float *pRow = prevIn + size_t(y) * netW * kChannels;
+	for (int y_ = int(y0); y_ < int(y1); ++y_) {
+		const unsigned int y = static_cast<unsigned int>(y_);
+		const Cover cy = cover(tilesY_, y);
 		uint16_t *rows[4];
-		for (unsigned dy = 0; dy < 4; ++dy)
+		for (unsigned int dy = 0; dy < 4; ++dy)
 			rows[dy] = bayer16 + size_t(4 * y + dy) * stridePx;
 
-		for (unsigned x = 0; x < packW; ++x) {
+		for (unsigned int x = 0; x < packW; ++x) {
 			alignas(16) float xf[kChannels];
 			gatherSqrt(rows, x, xfTable, xf);
-			const float alpha = 1.0f / (1.0f + std::exp(-aRow[x]));
-			const float *r = rRow + size_t(x) * kChannels;
-			float *p = pRow + size_t(x) * kChannels;
+			const Cover cx = cover(tilesX_, x);
+
+			unsigned int nt = 0, tile[4];
+			size_t local[4];
+			float weight[4];
+			for (unsigned int i = 0; i < cy.n; i++) {
+				for (unsigned int j = 0; j < cx.n; j++, nt++) {
+					tile[nt] = cy.tile[i] * nx + cx.tile[j];
+					local[nt] = (size_t(cy.local[i]) * netW + cx.local[j]) * kChannels;
+					weight[nt] = cy.weight[i] * cx.weight[j];
+				}
+			}
+			float *p = tilePrev<float>(tile[0]) + local[0];
 
 #if defined(__ARM_NEON)
 			const float32x4x4_t xv = vld1q_f32_x4(xf);
-			const float32x4x4_t rv = vld1q_f32_x4(r);
 			float32x4x4_t pv;
 			if (!first)
 				pv = vld1q_f32_x4(p);
-			const float32x4_t vAlpha = vdupq_n_f32(alpha);
 
 			float32x4x4_t out;
-			for (unsigned i = 0; i < 4; ++i) {
-				float32x4_t s = vaddq_f32(xv.val[i], rv.val[i]);
-				s = vminq_f32(vmaxq_f32(s, vZero), vOne);
-				out.val[i] = first ? s
-						   : vfmaq_f32(pv.val[i], vAlpha, vsubq_f32(s, pv.val[i]));
+			if (nt == 1) {
+				const float32x4x4_t rv = vld1q_f32_x4(tileR<float>(tile[0]) + local[0]);
+				const float a = tileA<float>(tile[0])[local[0] / kChannels];
+				const float32x4_t vAlpha = vdupq_n_f32(1.0f / (1.0f + std::exp(-a)));
+				for (unsigned int i = 0; i < 4; ++i) {
+					float32x4_t s = vaddq_f32(xv.val[i], rv.val[i]);
+					s = vminq_f32(vmaxq_f32(s, vZero), vOne);
+					out.val[i] = first ? s
+							   : vfmaq_f32(pv.val[i], vAlpha, vsubq_f32(s, pv.val[i]));
+				}
+			} else {
+				float32x4x4_t acc = { vZero, vZero, vZero, vZero };
+				for (unsigned int t = 0; t < nt; t++) {
+					const float32x4x4_t rv = vld1q_f32_x4(tileR<float>(tile[t]) + local[t]);
+					const float a = tileA<float>(tile[t])[local[t] / kChannels];
+					const float alpha = 1.0f / (1.0f + std::exp(-a));
+					const float32x4_t vW = vdupq_n_f32(first ? weight[t] : weight[t] * alpha);
+					for (unsigned int i = 0; i < 4; ++i) {
+						float32x4_t s = vaddq_f32(xv.val[i], rv.val[i]);
+						s = vminq_f32(vmaxq_f32(s, vZero), vOne);
+						acc.val[i] = vfmaq_f32(acc.val[i], vW, first ? s : vsubq_f32(s, pv.val[i]));
+					}
+				}
+				for (unsigned int i = 0; i < 4; ++i)
+					out.val[i] = first ? acc.val[i] : vaddq_f32(pv.val[i], acc.val[i]);
 			}
-			vst1q_f32_x4(p, out);
+			for (unsigned int t = 0; t < nt; t++)
+				vst1q_f32_x4(tilePrev<float>(tile[t]) + local[t], out);
 #else
 			float out[kChannels];
-			for (unsigned k = 0; k < kChannels; ++k) {
-				const float s = std::clamp(xf[k] + r[k], 0.0f, 1.0f);
-				out[k] = first ? s : std::fma(alpha, s - p[k], p[k]);
-				p[k] = out[k];
+			for (unsigned int k = 0; k < kChannels; ++k) {
+				const float pk = p[k];
+				float acc = 0.0f;
+				for (unsigned int t = 0; t < nt; t++) {
+					const float a = tileA<float>(tile[t])[local[t] / kChannels];
+					const float alpha = 1.0f / (1.0f + std::exp(-a));
+					const float s = std::clamp(xf[k] + tileR<float>(tile[t])[local[t] + k], 0.0f, 1.0f);
+					if (nt == 1)
+						acc = first ? s : std::fma(alpha, s - pk, pk);
+					else
+						acc = std::fma(first ? weight[t] : weight[t] * alpha, first ? s : s - pk, acc);
+				}
+				out[k] = nt == 1 || first ? acc : pk + acc;
 			}
+			for (unsigned int t = 0; t < nt; t++)
+				std::copy(out, out + kChannels, tilePrev<float>(tile[t]) + local[t]);
 #endif
 
 			if (x >= xStart)
@@ -800,19 +1102,30 @@ void DenoiseBstm::blendFloat(uint16_t *bayer16, unsigned stridePx)
 }
 
 /* Debug only: see dumpDir_. */
-void DenoiseBstm::dumpFrame(const uint16_t *bayer16, unsigned stridePx, const char *what)
+void DenoiseBstm::dumpFrame(const uint16_t *bayer16, unsigned int stridePx, const char *what)
 {
 	std::ostringstream name;
 	name << dumpDir_ << "/" << what << "_" << std::setw(4) << std::setfill('0') << dumpCount_
 	     << ".raw";
 	std::ofstream f(name.str(), std::ios::binary);
-	for (unsigned y = 0; y < height_; ++y)
+	for (unsigned int y = 0; y < height_; ++y)
 		f.write(reinterpret_cast<const char *>(bayer16 + size_t(y) * stridePx),
 			width_ * sizeof(uint16_t));
 	if (!f)
 		LOG(RPiDenoiseBstm, Error) << "Failed to write " << name.str();
 }
 
+/*
+ * The tiles are pipelined: this thread packs them all in raster order,
+ * handing each to the inference thread as it's ready (packing is much
+ * quicker than inference, so it soon runs ahead), then blends the frame in
+ * bands, one per row of tiles, as soon as the tiles covering each band are
+ * done. A band runs from the end of the cross-fade with the previous row of
+ * tiles to the end of the cross-fade with the next, so it needs its own row
+ * of tiles and the next one. Raw pixels are only overwritten once every tile
+ * has been packed, and each band reads and writes only its own pixels. With
+ * a single tile this is pack, invoke, blend, as before.
+ */
 void DenoiseBstm::prepare(Metadata *imageMetadata)
 {
 	std::pair<SharedFD, std::span<uint8_t>> bayer;
@@ -846,7 +1159,7 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 	const double syncStartMs = msSince(tStart);
 
 	uint16_t *bayer16 = reinterpret_cast<uint16_t *>(bayer.second.data());
-	const unsigned stridePx = rowBytes / sizeof(uint16_t);
+	const unsigned int stridePx = rowBytes / sizeof(uint16_t);
 	const bool dump = !dumpDir_.empty() && dumpCount_ < dumpFrames_;
 
 	if (dump) {
@@ -855,28 +1168,50 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 			<< dumpCount_ << " " << (firstFrame_ ? 1 : 0) << "\n";
 	}
 
+	const unsigned int nTiles = tiles(), nx = tilesX_.count, ny = tilesY_.count;
+	startFrame(nTiles);
+
 	const Clock::time_point t0 = Clock::now();
-	if (isFloat_)
-		packInput(bayer16, stridePx, xfTable_.data(), interpreter_->tensor(inX_)->data.f);
-	else
-		packInput(bayer16, stridePx, xqTable_.data(), interpreter_->tensor(inX_)->data.int8);
+	for (unsigned int k = 0; k < nTiles; k++) {
+		if (isFloat_)
+			packTile(k, bayer16, stridePx, xfTable_.data());
+		else
+			packTile(k, bayer16, stridePx, xqTable_.data());
+		publishPacked(k + 1);
+	}
 	const double packMs = msSince(t0);
 
-	const Clock::time_point t1 = Clock::now();
-	if (interpreter_->Invoke() != kTfLiteOk) {
+	double waitMs = 0.0, blendMs = 0.0;
+	bool ok = true;
+	for (unsigned int j = 0; j < ny && ok; j++) {
+		const Clock::time_point tw = Clock::now();
+		ok = waitDone(std::min(ny, j + 2) * nx);
+		waitMs += msSince(tw);
+		if (!ok)
+			break;
+
+		const unsigned int y0 = j ? tilesY_.rampEnd[j - 1] : 0;
+		const unsigned int y1 = j + 1 < ny ? tilesY_.rampEnd[j] : packH_;
+		const Clock::time_point tb = Clock::now();
+		if (isFloat_)
+			blendBandFloat(bayer16, stridePx, y0, y1);
+		else
+			blendBandInt8(bayer16, stridePx, y0, y1);
+		blendMs += msSince(tb);
+	}
+
+	double npuMs;
+	{
+		std::lock_guard<std::mutex> lock(npuMutex_);
+		npuMs = npuMs_;
+	}
+
+	if (!ok) {
 		LOG(RPiDenoiseBstm, Error) << "NPU inference failed";
 		dmabufSyncEnd(bayer.first);
 		reset();
 		return;
 	}
-	const double invokeMs = msSince(t1);
-
-	const Clock::time_point t2 = Clock::now();
-	if (isFloat_)
-		blendFloat(bayer16, stridePx);
-	else
-		blendInt8(bayer16, stridePx);
-	const double blendMs = msSince(t2);
 	firstFrame_ = false;
 
 	if (dump) {
@@ -890,8 +1225,8 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 
 	LOG(RPiDenoiseBstm, Debug)
 		<< "sync " << syncStartMs << " + " << syncEndMs << " ms, pack " << packMs
-		<< " ms, network " << invokeMs << " ms, blend " << blendMs << " ms, total "
-		<< msSince(tStart) << " ms";
+		<< " ms, network " << npuMs << " ms (" << nTiles << " tiles), waiting " << waitMs
+		<< " ms, blend " << blendMs << " ms, total " << msSince(tStart) << " ms";
 
 	/*
 	 * The classic stages' noise thresholds scale with the noise model's
