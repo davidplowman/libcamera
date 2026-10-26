@@ -117,9 +117,9 @@
         {
             "rpi.denoise_bstm":
             {
-                "slow-model": "/home/pi/libcamera/src/ipa/rpi/pisp/data/tflite/imx662_64_2e12_16x80x80_g32-192_c025_d100_int8.tflite",
-                "fast-model": "/home/pi/libcamera/src/ipa/rpi/pisp/data/tflite/imx662_32_2e13w_16x80x80_g32-192_c025_d100_int8.tflite",
-                "float-model": "/home/pi/libcamera/src/ipa/rpi/pisp/data/tflite/imx662_32_2e13w_16x60x60_g32-192_c025_d100_fp32.tflite",
+                "slow-model": "imx662_64_2e12_16x80x80_g32-192_c025_d100_int8.tflite",
+                "fast-model": "imx662_32_2e13w_16x80x80_g32-192_c025_d100_int8.tflite",
+                "float-model": "imx662_32_2e13w_16x60x60_g32-192_c025_d100_fp32.tflite",
                 "model": "slow-model",
                 "gain_threshold_on": 32.0,
                 "gain_threshold_off": 24.0,
@@ -174,7 +174,7 @@
                 {
                     "auto":
                     {
-                        "lo": 2910.0,
+                        "lo": 2500.0,
                         "hi": 5535.0
                     },
                     "incandescent":
@@ -211,6 +211,7 @@
                 "bayes": 1,
                 "ct_curve":
                 [
+                    2500.0, 0.6632, 0.2893,
                     2910.0, 0.5579, 0.3553,
                     3600.0, 0.4693, 0.4364,
                     4490.0, 0.3855, 0.5469,
@@ -269,6 +270,7 @@
                 "enable_nn": 1,
                 "ct_curve":
                 [
+                    2500.0, 0.6632, 0.2893,
                     2910.0, 0.5579, 0.3553,
                     3600.0, 0.4693, 0.4364,
                     4490.0, 0.3855, 0.5469,
@@ -360,23 +362,23 @@
                         {
                             "normal":
                             {
-                                "shutter": [ 13, 10000, 30000, 60000, 66666 ],
-                                "gain": [ 1.0, 1.5, 2.0, 4.0, 200.0 ]
+                                "shutter": [ 13, 1000, 5000, 10000, 66666 ],
+                                "gain": [ 2.0, 4.0, 8.0, 32.0, 300.0 ]
                             },
                             "short":
                             {
-                                "shutter": [ 13, 5000, 10000, 20000, 60000 ],
-                                "gain": [ 1.0, 1.5, 2.0, 4.0, 200.0 ]
+                                "shutter": [ 13, 1000, 5000, 10000, 66666 ],
+                                "gain": [ 2.0, 8.0, 32.0, 128.0, 300.0 ]
                             },
                             "long":
                             {
-                                "shutter": [ 13, 10000, 30000, 60000, 90000, 120000 ],
-                                "gain": [ 1.0, 1.5, 2.0, 4.0, 8.0, 200.0 ]
+                                "shutter": [ 13, 5000, 10000, 30000, 60000, 125000 ],
+                                "gain": [ 2.0, 4.0, 8.0, 16.0, 32.0, 300.0 ]
                             },
                             "custom":
                             {
-                                "shutter": [ 13, 10000, 30000, 33333 ],
-                                "gain": [ 1.0, 8.0, 16.0, 1000.0 ]
+                                "shutter": [ 13, 10000, 30000, 66666 ],
+                                "gain": [ 2.0, 8.0, 32.0, 500.0 ]
                             }
                         },
                         "constraint_modes":

@@ -22,6 +22,7 @@
 
 #include <linux/dma-buf.h>
 
+#include <libcamera/base/file.h>
 #include <libcamera/base/log.h>
 #include <libcamera/base/shared_fd.h>
 #include <libcamera/base/span.h>
@@ -46,6 +47,38 @@ LOG_DEFINE_CATEGORY(RPiDenoiseBstm)
 #define NAME "rpi.denoise_bstm"
 
 namespace {
+
+/*
+ * A model given by file name rather than absolute path is looked for in the
+ * source tree when running uninstalled from the build directory, then where
+ * it's installed, preferring /usr/local. If it's nowhere, the name is
+ * returned unchanged and loading it fails later.
+ */
+std::string findModel(const std::string &name)
+{
+	if (name.empty() || name[0] == '/')
+		return name;
+
+	std::vector<std::string> paths;
+	const std::string root = utils::libcameraSourcePath();
+	if (!root.empty())
+		paths.push_back(root + "src/ipa/rpi/pisp/data/tflite/" + name);
+	for (const char *dir : { "/usr/local/share/libcamera", LIBCAMERA_DATA_DIR,
+				 "/usr/share/libcamera" }) {
+		const std::string path = std::string(dir) + "/ipa/rpi/pisp/tflite/" + name;
+		if (std::find(paths.begin(), paths.end(), path) == paths.end())
+			paths.push_back(path);
+	}
+
+	for (const std::string &path : paths) {
+		if (File::exists(path))
+			return path;
+	}
+
+	LOG(RPiDenoiseBstm, Error)
+		<< "Model " << name << " not found in any of: " << utils::join(paths, ", ");
+	return name;
+}
 
 void dmabufSyncStart(const SharedFD &fd)
 {
@@ -339,6 +372,7 @@ int DenoiseBstm::Config::read(const libcamera::ValueNode &params)
 	/* "model" may instead name another key that holds the model's path. */
 	if (!model.empty() && params.contains(model))
 		model = params[model].get<std::string>("");
+	model = findModel(model);
 	delegate = params["delegate"].get<std::string>(RPI_TEFLON_PATH);
 	floatFormat = params["float_format"].get<std::string>("bf16");
 	sdnFactor = params["sdn_factor"].get<double>(0.0);
@@ -756,13 +790,13 @@ void DenoiseBstm::reset()
 void DenoiseBstm::checkGain(double analogueGain)
 {
 	if (!aiOn_ && analogueGain >= config_.gainThresholdOn) {
-		LOG(RPiDenoiseBstm, Info)
+		LOG(RPiDenoiseBstm, Debug)
 			<< "Analogue gain " << analogueGain << " -- switching AI denoise on";
 		aiOn_ = true;
 		lastExposure_ = 0.0;
 		reset();
 	} else if (aiOn_ && analogueGain < config_.gainThresholdOff) {
-		LOG(RPiDenoiseBstm, Info)
+		LOG(RPiDenoiseBstm, Debug)
 			<< "Analogue gain " << analogueGain << " -- switching AI denoise off";
 		aiOn_ = false;
 	}

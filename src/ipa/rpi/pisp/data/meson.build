@@ -38,3 +38,15 @@ conf_files = files([
 
 install_data(conf_files,
              install_dir : ipa_data_dir / 'rpi' / 'pisp')
+
+# Models for rpi.denoise_bstm, which finds them by file name.
+tflite_files = files([
+    'tflite/imx662_32_2e13w_16x274x484_g32-192_c025_d100_int8.tflite',
+    'tflite/imx662_32_2e13w_16x60x60_g32-192_c025_d100_fp32.tflite',
+    'tflite/imx662_32_2e13w_16x80x80_g32-192_c025_d100_int8.tflite',
+    'tflite/imx662_64_2e12_16x274x484_g32-192_c025_d100_int8.tflite',
+    'tflite/imx662_64_2e12_16x80x80_g32-192_c025_d100_int8.tflite',
+])
+
+install_data(tflite_files,
+             install_dir : ipa_data_dir / 'rpi' / 'pisp' / 'tflite')

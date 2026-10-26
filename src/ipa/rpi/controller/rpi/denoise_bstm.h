@@ -99,9 +99,14 @@ private:
 
 		/*
 		 * The TFLite model (int8 or float32); its size is the tile size.
-		 * The tuning file's "model" is either the path itself or the name
-		 * of another key in the block whose value is the path, so that
-		 * several models can be listed and one chosen by name.
+		 * The tuning file's "model" is either the model itself or the name
+		 * of another key in the block whose value is the model, so that
+		 * several can be listed and one chosen by name. A model is an
+		 * absolute path, or a file name looked for in the source tree's
+		 * src/ipa/rpi/pisp/data/tflite when running uninstalled, then in
+		 * <datadir>/libcamera/ipa/rpi/pisp/tflite under /usr/local/share,
+		 * libcamera's own datadir and /usr/share, in that order. This
+		 * holds the absolute path once found.
 		 */
 		std::string model;
 
