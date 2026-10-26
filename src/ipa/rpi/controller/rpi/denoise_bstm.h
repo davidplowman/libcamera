@@ -31,6 +31,8 @@
 
 #include "../denoise_algorithm.h"
 
+struct DeviceStatus;
+
 namespace RPiController {
 
 class DenoiseBstm : public DenoiseAlgorithm
@@ -67,7 +69,8 @@ private:
 			 float &scale, int &zp);
 	void buildTables();
 	void reset();
-	void checkForReset(Metadata *imageMetadata);
+	void checkGain(double analogueGain);
+	void checkForReset(const DeviceStatus &deviceStatus);
 	template<typename T>
 	void packTile(unsigned int k, const uint16_t *bayer16, unsigned int stridePx, const T *table);
 	void blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned int stridePx);
@@ -158,6 +161,17 @@ private:
 		 * The network was only trained on fixed-gain sequences.
 		 */
 		double resetRatio = 2.0;
+
+		/*
+		 * The network runs only at high analogue gain, where the classic
+		 * hardware denoise stages fall short. It switches on when the gain
+		 * reaches gainThresholdOn and off again when it drops below
+		 * gainThresholdOff; between the two it stays as it was, so it
+		 * doesn't flip back and forth. While off, the frame and the
+		 * hardware stages' statuses are left untouched.
+		 */
+		double gainThresholdOn = 32.0;
+		double gainThresholdOff = 24.0;
 
 		/*
 		 * Debug only: write the raw frame before and after denoising, for
@@ -272,6 +286,9 @@ private:
 	std::vector<int8_t> prevQ_;
 	std::vector<float> prevFloat_;
 	bool firstFrame_ = true;
+
+	/* Whether the network is running, by Config::gainThresholdOn/Off. */
+	bool aiOn_ = false;
 
 	/* exposure time x analogue gain of the last frame, for Config::resetRatio. */
 	double lastExposure_ = 0.0;

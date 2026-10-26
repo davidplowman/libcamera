@@ -350,6 +350,8 @@ int DenoiseBstm::Config::read(const libcamera::ValueNode &params)
 	cpuThreads = params["cpu_threads"].get<int>(3);
 	demo = params["demo"].get<bool>(false);
 	resetRatio = params["reset_ratio"].get<double>(2.0);
+	gainThresholdOn = params["gain_threshold_on"].get<double>(32.0);
+	gainThresholdOff = params["gain_threshold_off"].get<double>(24.0);
 
 	dumpDir = params["dump_dir"].get<std::string>("");
 	dumpFrames = params["dump_frames"].get<unsigned int>(0);
@@ -373,6 +375,12 @@ int DenoiseBstm::Config::read(const libcamera::ValueNode &params)
 
 	if (!(resetRatio > 1.0)) {
 		LOG(RPiDenoiseBstm, Error) << "\"reset_ratio\" must be greater than 1";
+		return -EINVAL;
+	}
+
+	if (gainThresholdOff > gainThresholdOn) {
+		LOG(RPiDenoiseBstm, Error)
+			<< "\"gain_threshold_off\" must not be greater than \"gain_threshold_on\"";
 		return -EINVAL;
 	}
 
@@ -742,15 +750,30 @@ void DenoiseBstm::reset()
 }
 
 /*
+ * Switch the network on or off by the analogue gain, with hysteresis. It
+ * restarts from frame 0 when it comes back on, as its state is stale.
+ */
+void DenoiseBstm::checkGain(double analogueGain)
+{
+	if (!aiOn_ && analogueGain >= config_.gainThresholdOn) {
+		LOG(RPiDenoiseBstm, Info)
+			<< "Analogue gain " << analogueGain << " -- switching AI denoise on";
+		aiOn_ = true;
+		lastExposure_ = 0.0;
+		reset();
+	} else if (aiOn_ && analogueGain < config_.gainThresholdOff) {
+		LOG(RPiDenoiseBstm, Info)
+			<< "Analogue gain " << analogueGain << " -- switching AI denoise off";
+		aiOn_ = false;
+	}
+}
+
+/*
  * Restart on a large jump in exposure time x analogue gain, which the
  * network was never trained across.
  */
-void DenoiseBstm::checkForReset(Metadata *imageMetadata)
+void DenoiseBstm::checkForReset(const DeviceStatus &deviceStatus)
 {
-	DeviceStatus deviceStatus;
-	if (imageMetadata->get("device.status", deviceStatus) != 0)
-		return;
-
 	const double exposure = deviceStatus.exposureTime.get<std::micro>() * deviceStatus.analogueGain;
 	if (exposure <= 0.0)
 		return;
@@ -1161,6 +1184,15 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 	if (!active_ || !bayer.second.data() || !width_ || !height_)
 		return;
 
+	DeviceStatus deviceStatus;
+	if (imageMetadata->get("device.status", deviceStatus) == 0) {
+		checkGain(deviceStatus.analogueGain);
+		if (aiOn_)
+			checkForReset(deviceStatus);
+	}
+	if (!aiOn_)
+		return;
+
 	/*
 	 * Accept row padding but reject a compressed buffer: bytes-per-row
 	 * >= width, not an exact size.
@@ -1178,8 +1210,6 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 		}
 		return;
 	}
-
-	checkForReset(imageMetadata);
 
 	const Clock::time_point tStart = Clock::now();
 	dmabufSyncStart(bayer.first);

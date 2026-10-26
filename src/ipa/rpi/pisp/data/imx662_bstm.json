@@ -102,6 +102,8 @@
                 "fast-model": "/home/pi/libcamera/src/ipa/rpi/pisp/data/tflite/imx662_32_2e13w_16x80x80_g32-192_c025_d100_int8.tflite",
                 "float-model": "/home/pi/libcamera/src/ipa/rpi/pisp/data/tflite/imx662_32_2e13w_16x60x60_g32-192_c025_d100_fp32.tflite",
                 "model": "slow-model",
+		"gain_threshold_on": 32.0,
+		"gain_threshold_off": 24.0,
                 "float_format": "bf16",
                 "min_overlap": 4,
                 "cpu": false,
@@ -970,7 +972,7 @@
                         "exposure_modes": {
                             "normal": {
                                 "shutter": [
-                                    100,
+                                    13,
                                     10000,
                                     30000,
                                     60000,
@@ -981,12 +983,12 @@
                                     1.5,
                                     2.0,
                                     4.0,
-                                    8.0
+                                    200.0
                                 ]
                             },
                             "short": {
                                 "shutter": [
-                                    100,
+                                    13,
                                     5000,
                                     10000,
                                     20000,
@@ -997,12 +999,12 @@
                                     1.5,
                                     2.0,
                                     4.0,
-                                    8.0
+                                    200.0
                                 ]
                             },
                             "long": {
                                 "shutter": [
-                                    100,
+                                    13,
                                     10000,
                                     30000,
                                     60000,
@@ -1015,12 +1017,12 @@
                                     2.0,
                                     4.0,
                                     8.0,
-                                    12.0
+                                    200.0
                                 ]
                             },
                             "custom": {
                                 "shutter": [
-                                    100,
+                                    13,
                                     10000,
                                     30000,
                                     33333
