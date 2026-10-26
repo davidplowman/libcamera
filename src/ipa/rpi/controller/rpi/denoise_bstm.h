@@ -49,19 +49,24 @@ public:
 
 	/*
 	 * The tile layout along one axis, in network (packed) pixels. Each
-	 * position of the frame is covered by tile0[p] with weight weight0[p],
-	 * and, where weight0[p] < 1, also by tile0[p] + 1 with the rest. The
-	 * weights ramp linearly across the middle of each overlap. Tile i
-	 * finishes positions [region[i], region[i + 1]): it's the last tile
-	 * contributing to them, so they can be blended as soon as it's done.
+	 * position p of the frame is covered by tile pixelTile[p] with weight
+	 * pixelWeight[p] and, where pixelWeight[p] < 1, also by tile
+	 * pixelTile[p] + 1 with the rest. The weights ramp linearly across the
+	 * middle of each overlap.
+	 *
+	 * Positions are blended as soon as the last tile they need is done.
+	 * For tile i, that's positions [blendStart[i], blendStart[i + 1]): from
+	 * the start of its cross-fade with tile i - 1 (which finished earlier)
+	 * to the start of its cross-fade with tile i + 1 (which also needs
+	 * tile i + 1, so belongs to that tile instead).
 	 */
 	struct TileAxis {
-		unsigned int count = 0; /* tiles along this axis */
+		unsigned int tileCount = 0; /* tiles along this axis */
 		unsigned int valid = 0; /* network pixels per tile backed by the frame */
-		std::vector<unsigned int> origin; /* each tile's first frame position */
-		std::vector<unsigned int> region; /* count + 1 boundaries, from 0 to the frame size */
-		std::vector<uint16_t> tile0;
-		std::vector<float> weight0;
+		std::vector<unsigned int> tileStart; /* each tile's first pixel location */
+		std::vector<unsigned int> blendStart; /* where blending into the next tile starts */
+		std::vector<uint16_t> pixelTile; /* first tile each pixel lies in */
+		std::vector<float> pixelWeight; /* weight of that pixel in that tile */
 	};
 
 private:
@@ -82,7 +87,7 @@ private:
 	void publishPacked(unsigned int packed);
 	bool waitDone(unsigned int tiles);
 
-	unsigned int tiles() const { return tilesX_.count * tilesY_.count; }
+	unsigned int tiles() const { return tilesX_.tileCount * tilesY_.tileCount; }
 	uint8_t *tileBase(unsigned int k) const { return tileBuffers_.get() + k * tileBytes_; }
 	template<typename T>
 	T *tileX(unsigned int k) const { return reinterpret_cast<T *>(tileBase(k) + offX_); }

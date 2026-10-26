@@ -159,65 +159,68 @@ bool cameraModesMatch(const CameraMode &a, const CameraMode &b)
 }
 
 /*
- * Lay tiles of net network pixels along an axis of pack. A frame no larger
- * than the model is a single tile at 0. Otherwise the fewest tiles that
- * overlap by at least minOverlap are spread evenly from 0 to pack - net, at
- * even positions (but the last, which ends flush), so that their
- * half-resolution grids line up. Each pair of neighbours is cross-faded
- * linearly across the middle of its overlap, over no more than the distance
- * between them, so that no position is ever covered by more than two tiles.
- * Tile i + 1 is the last to contribute from the start of its cross-fade with
- * tile i, so that is where its region begins.
+ * Lay tiles of tileSize along an axis of frameSize, both in network pixels.
+ * A frame no larger than the model is a single tile at 0. Otherwise the
+ * fewest tiles that overlap by at least minOverlap are spread evenly from 0
+ * to frameSize - tileSize, at even positions (but the last, which ends
+ * flush), so that their half-resolution grids line up. Each pair of
+ * neighbours is cross-faded linearly across the middle of its overlap, over
+ * no more than the distance between them, so that no position is ever
+ * covered by more than two tiles. Tile i + 1 is the last to contribute from
+ * the start of its cross-fade with tile i, so that is where its blending
+ * starts (TileAxis::blendStart).
  */
-void layoutAxis(unsigned int pack, unsigned int net, unsigned int minOverlap,
+void layoutAxis(unsigned int frameSize, unsigned int tileSize, unsigned int minOverlap,
 		DenoiseBstm::TileAxis &axis)
 {
-	axis.origin.clear();
-	axis.region.assign(1, 0);
+	axis.tileStart.clear();
 
-	if (pack <= net) {
-		axis.count = 1;
-		axis.valid = pack;
-		axis.origin.push_back(0);
+	if (frameSize <= tileSize) {
+		axis.tileCount = 1;
+		axis.valid = frameSize;
+		axis.tileStart.push_back(0);
 	} else {
-		const unsigned int last = pack - net;
-		axis.valid = net;
-		axis.count = (pack - minOverlap + net - minOverlap - 1) / (net - minOverlap);
-		for (;; axis.count++) {
-			axis.origin.clear();
-			for (unsigned int i = 0; i < axis.count; i++) {
-				const double ideal = double(i) * last / (axis.count - 1);
+		const unsigned int last = frameSize - tileSize;
+		const unsigned int maxStep = tileSize - minOverlap;
+		axis.valid = tileSize;
+		axis.tileCount = (frameSize - minOverlap + maxStep - 1) / maxStep;
+
+		for (;; axis.tileCount++) {
+			axis.tileStart.clear();
+			for (unsigned int i = 0; i < axis.tileCount; i++) {
+				const double ideal = double(i) * last / (axis.tileCount - 1);
 				const unsigned int even = 2 * static_cast<unsigned int>(std::lround(ideal / 2));
-				axis.origin.push_back(i + 1 == axis.count ? last : even);
+				axis.tileStart.push_back(i + 1 == axis.tileCount ? last : even);
 			}
 			bool ok = true;
-			for (unsigned int i = 0; i + 1 < axis.count; i++)
-				ok &= axis.origin[i + 1] - axis.origin[i] <= net - minOverlap;
+			for (unsigned int i = 0; i + 1 < axis.tileCount; i++)
+				ok &= axis.tileStart[i + 1] - axis.tileStart[i] <= maxStep;
 			if (ok)
 				break;
 		}
 	}
 
-	axis.tile0.assign(pack, 0);
-	axis.weight0.assign(pack, 1.0f);
+	axis.pixelTile.assign(frameSize, 0);
+	axis.pixelWeight.assign(frameSize, 1.0f);
+	axis.blendStart.assign(1, 0);
 	unsigned int p = 0;
-	for (unsigned int i = 0; i + 1 < axis.count; i++) {
-		const unsigned int end = axis.origin[i] + net; /* tile i ends here */
-		const unsigned int ovl = end - axis.origin[i + 1];
-		unsigned int len = std::min(ovl, axis.origin[i + 1] - axis.origin[i]);
-		const unsigned int start = std::max(axis.origin[i + 1] + (ovl - len) / 2, p);
+	for (unsigned int i = 0; i + 1 < axis.tileCount; i++) {
+		const unsigned int end = axis.tileStart[i] + tileSize; /* tile i ends here */
+		const unsigned int overlap = end - axis.tileStart[i + 1]; /* with tile i + 1 */
+		unsigned int len = std::min(overlap, axis.tileStart[i + 1] - axis.tileStart[i]);
+		const unsigned int start = std::max(axis.tileStart[i + 1] + (overlap - len) / 2, p);
 		len = std::min(len, end - start);
 		for (; p < start; p++)
-			axis.tile0[p] = i;
-		axis.region.push_back(p);
+			axis.pixelTile[p] = i;
+		axis.blendStart.push_back(p);
 		for (unsigned int j = 0; j < len; j++, p++) {
-			axis.tile0[p] = i;
-			axis.weight0[p] = 1.0f - (j + 0.5f) / len;
+			axis.pixelTile[p] = i;
+			axis.pixelWeight[p] = 1.0f - (j + 0.5f) / len;
 		}
 	}
-	for (; p < pack; p++)
-		axis.tile0[p] = axis.count - 1;
-	axis.region.push_back(pack);
+	for (; p < frameSize; p++)
+		axis.pixelTile[p] = axis.tileCount - 1;
+	axis.blendStart.push_back(frameSize);
 }
 
 /*
@@ -325,11 +328,11 @@ struct Cover {
 
 inline Cover cover(const DenoiseBstm::TileAxis &axis, unsigned int p)
 {
-	const unsigned int t = axis.tile0[p];
-	const float w = axis.weight0[p];
+	const unsigned int t = axis.pixelTile[p];
+	const float w = axis.pixelWeight[p];
 	if (w < 1.0f)
-		return { 2, { t, t + 1 }, { p - axis.origin[t], p - axis.origin[t + 1] }, { w, 1.0f - w } };
-	return { 1, { t, t }, { p - axis.origin[t], 0 }, { 1.0f, 0.0f } };
+		return { 2, { t, t + 1 }, { p - axis.tileStart[t], p - axis.tileStart[t + 1] }, { w, 1.0f - w } };
+	return { 1, { t, t }, { p - axis.tileStart[t], 0 }, { 1.0f, 0.0f } };
 }
 
 } /* namespace */
@@ -731,10 +734,11 @@ void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 
 	/* Every frame position is finished by exactly one tile. */
 	for (const TileAxis *axis : { &tilesX_, &tilesY_ }) {
-		ASSERT(axis->region.size() == axis->count + 1 && axis->region.front() == 0);
-		ASSERT(std::is_sorted(axis->region.begin(), axis->region.end()));
+		ASSERT(axis->blendStart.size() == axis->tileCount + 1);
+		ASSERT(axis->blendStart.front() == 0);
+		ASSERT(std::is_sorted(axis->blendStart.begin(), axis->blendStart.end()));
 	}
-	ASSERT(tilesX_.region.back() == packW_ && tilesY_.region.back() == packH_);
+	ASSERT(tilesX_.blendStart.back() == packW_ && tilesY_.blendStart.back() == packH_);
 
 	const size_t state = size_t(packW_) * packH_ * kChannels;
 	prev_.assign(isFloat_ ? 0 : state, 0);
@@ -747,11 +751,11 @@ void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 	reset();
 
 	auto overlaps = [](const TileAxis &axis, unsigned int net) {
-		if (axis.count < 2)
+		if (axis.tileCount < 2)
 			return std::string("-");
 		unsigned int lo = net, hi = 0;
-		for (unsigned int i = 0; i + 1 < axis.count; i++) {
-			const unsigned int o = axis.origin[i] + net - axis.origin[i + 1];
+		for (unsigned int i = 0; i + 1 < axis.tileCount; i++) {
+			const unsigned int o = axis.tileStart[i] + net - axis.tileStart[i + 1];
 			lo = std::min(lo, o);
 			hi = std::max(hi, o);
 		}
@@ -759,9 +763,9 @@ void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 	};
 	LOG(RPiDenoiseBstm, Info)
 		<< "Bayer " << width_ << "x" << height_ << " (" << packW_ << "x" << packH_
-		<< " network pixels) -> " << tilesX_.count << "x" << tilesY_.count << " tiles of "
-		<< netW_ << "x" << netH_ << ", overlaps " << overlaps(tilesX_, netW_) << " x "
-		<< overlaps(tilesY_, netH_) << " (minimum " << config_.minOverlap << "), "
+		<< " network pixels) -> " << tilesX_.tileCount << "x" << tilesY_.tileCount
+		<< " tiles of " << netW_ << "x" << netH_ << ", overlaps " << overlaps(tilesX_, netW_)
+		<< " x " << overlaps(tilesY_, netH_) << " (minimum " << config_.minOverlap << "), "
 		<< bytes / 1024 << " KiB of tile buffers";
 }
 
@@ -900,8 +904,8 @@ void DenoiseBstm::packTile(unsigned int k, const uint16_t *bayer16, unsigned int
 {
 	const unsigned int netW = netW_, packW = packW_;
 	const unsigned int validW = tilesX_.valid, validH = tilesY_.valid;
-	const unsigned int ox = tilesX_.origin[k % tilesX_.count];
-	const unsigned int oy = tilesY_.origin[k / tilesX_.count];
+	const unsigned int ox = tilesX_.tileStart[k % tilesX_.tileCount];
+	const unsigned int oy = tilesY_.tileStart[k / tilesX_.tileCount];
 	T *in = tileX<T>(k);
 	T *prevIn = tilePrev<T>(k);
 	const T *state;
@@ -956,10 +960,10 @@ void DenoiseBstm::packTile(unsigned int k, const uint16_t *bayer16, unsigned int
  */
 void DenoiseBstm::blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned int stridePx)
 {
-	const unsigned int netW = netW_, packW = packW_, nx = tilesX_.count;
+	const unsigned int netW = netW_, packW = packW_, nx = tilesX_.tileCount;
 	const unsigned int tx = k % nx, ty = k / nx;
-	const unsigned int x0 = tilesX_.region[tx], x1 = tilesX_.region[tx + 1];
-	const unsigned int y0 = tilesY_.region[ty], y1 = tilesY_.region[ty + 1];
+	const unsigned int x0 = tilesX_.blendStart[tx], x1 = tilesX_.blendStart[tx + 1];
+	const unsigned int y0 = tilesY_.blendStart[ty], y1 = tilesY_.blendStart[ty + 1];
 	/* config_.demo: write back the right half only (but update everything else). */
 	const unsigned int xStart = std::max(x0, config_.demo ? packW / 2 : 0);
 	const bool first = firstFrame_;
@@ -1084,10 +1088,10 @@ void DenoiseBstm::blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned in
  */
 void DenoiseBstm::blendRegionFloat(unsigned int k, uint16_t *bayer16, unsigned int stridePx)
 {
-	const unsigned int netW = netW_, packW = packW_, nx = tilesX_.count;
+	const unsigned int netW = netW_, packW = packW_, nx = tilesX_.tileCount;
 	const unsigned int tx = k % nx, ty = k / nx;
-	const unsigned int x0 = tilesX_.region[tx], x1 = tilesX_.region[tx + 1];
-	const unsigned int y0 = tilesY_.region[ty], y1 = tilesY_.region[ty + 1];
+	const unsigned int x0 = tilesX_.blendStart[tx], x1 = tilesX_.blendStart[tx + 1];
+	const unsigned int y0 = tilesY_.blendStart[ty], y1 = tilesY_.blendStart[ty + 1];
 	/* config_.demo: write back the right half only (but update everything else). */
 	const unsigned int xStart = std::max(x0, config_.demo ? packW / 2 : 0);
 	const bool first = firstFrame_;
