@@ -15,6 +15,12 @@
  * the NPU to keep all their intermediate tensors in its on-chip memory run
  * much faster than a whole frame, which streams every layer through DRAM.
  * Packing, inference and blending are pipelined across the tiles.
+ *
+ * The model is trained on one Bayer order. A sensor whose order differs (often
+ * because its flips change it) is mirrored horizontally and/or vertically as
+ * it's packed, and mirrored back as the result is written, so the model always
+ * sees its own order. The tiles and the recurrent state are all in this
+ * mirrored view, which costs nothing extra.
  */
 #pragma once
 
@@ -76,9 +82,11 @@ private:
 	void reset();
 	void checkGain(double analogueGain);
 	void checkForReset(const DeviceStatus &deviceStatus);
-	template<typename T>
+	template<typename T, bool HFlip>
 	void packTile(unsigned int k, const uint16_t *bayer16, unsigned int stridePx, const T *table);
+	template<bool HFlip>
 	void blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned int stridePx);
+	template<bool HFlip>
 	void blendRegionFloat(unsigned int k, uint16_t *bayer16, unsigned int stridePx);
 	void dumpFrame(const uint16_t *bayer16, unsigned int stridePx, const char *what);
 
@@ -127,6 +135,12 @@ private:
 		std::string floatFormat;
 
 		/*
+		 * The Bayer order the model was trained on, "RGGB", "GRBG", "GBRG"
+		 * or "BGGR". Frames in any other order are mirrored to match it.
+		 */
+		libcamera::BayerFormat::Order modelBayerOrder = libcamera::BayerFormat::RGGB;
+
+		/*
 		 * How much of the classic PISP hardware denoise stages to keep on
 		 * top of ours. 0 erases a stage's status, so it doesn't run at all
 		 * on a frame we've handled ourselves; otherwise its noise constants
@@ -142,7 +156,8 @@ private:
 		 * When set, everything runs as normal (so the recurrent state stays
 		 * correct) but only the right half of the denoised result is
 		 * written back over the raw buffer, leaving the left half untouched
-		 * for side-by-side comparison.
+		 * for side-by-side comparison. These are the halves of the raw
+		 * buffer, whichever way it's mirrored for the model.
 		 */
 		bool demo = false;
 
@@ -227,6 +242,22 @@ private:
 
 	TileAxis tilesX_;
 	TileAxis tilesY_;
+
+	/*
+	 * Whether the raw frame is mirrored horizontally and/or vertically for
+	 * the model, its Bayer order differing from Config::modelBayerOrder.
+	 * Everything else (network pixel positions, tiles, the state) is in this
+	 * mirrored view; only reading and writing the raw buffer see the flips,
+	 * through rawRow() and blockColumn(). Mirroring an axis of even length
+	 * swaps the parity of every position, and so the Bayer order, without
+	 * moving the 4x4 blocks off the grid. Any rows or columns beyond the last
+	 * whole 4x4 block, which are never processed, then lie at the top or
+	 * left.
+	 */
+	bool hflip_ = false;
+	bool vflip_ = false;
+	/* The raw row holding row r of the mirrored view. */
+	unsigned int rawRow(unsigned int r) const { return vflip_ ? height_ - 1 - r : r; }
 
 	/*
 	 * Every tile's x and prev inputs and r and a outputs, allocated once

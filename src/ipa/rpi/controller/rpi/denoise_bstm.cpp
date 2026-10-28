@@ -80,6 +80,35 @@ std::string findModel(const std::string &name)
 	return name;
 }
 
+const std::pair<const char *, BayerFormat::Order> kBayerOrders[] = {
+	{ "BGGR", BayerFormat::BGGR },
+	{ "GBRG", BayerFormat::GBRG },
+	{ "GRBG", BayerFormat::GRBG },
+	{ "RGGB", BayerFormat::RGGB },
+};
+
+/*
+ * The four Bayer orders are numbered so that mirroring horizontally flips
+ * bit 0 and mirroring vertically flips bit 1: BGGR mirrored horizontally is
+ * GBRG, vertically GRBG, and both ways RGGB.
+ */
+static_assert(BayerFormat::BGGR == 0 && BayerFormat::GBRG == 1 && BayerFormat::GRBG == 2 &&
+	      BayerFormat::RGGB == 3);
+
+bool isBayer(BayerFormat::Order order)
+{
+	return order <= BayerFormat::RGGB;
+}
+
+std::string bayerOrderName(BayerFormat::Order order)
+{
+	for (const auto &[name, value] : kBayerOrders) {
+		if (value == order)
+			return name;
+	}
+	return "non-Bayer (" + std::to_string(order) + ")";
+}
+
 void dmabufSyncStart(const SharedFD &fd)
 {
 	struct dma_buf_sync dma_sync{};
@@ -155,7 +184,8 @@ bool cameraModesMatch(const CameraMode &a, const CameraMode &b)
 	return a.bitdepth == b.bitdepth && a.width == b.width && a.height == b.height &&
 	       a.sensorWidth == b.sensorWidth && a.sensorHeight == b.sensorHeight &&
 	       a.binX == b.binX && a.binY == b.binY && a.cropX == b.cropX && a.cropY == b.cropY &&
-	       a.scaleX == b.scaleX && a.scaleY == b.scaleY && a.transform == b.transform;
+	       a.scaleX == b.scaleX && a.scaleY == b.scaleY && a.transform == b.transform &&
+	       a.bayerOrder == b.bayerOrder;
 }
 
 /*
@@ -224,29 +254,49 @@ void layoutAxis(unsigned int frameSize, unsigned int tileSize, unsigned int minO
 }
 
 /*
- * The current frame's square root for network pixel x, in channel order,
- * looked up from the raw values (rows[dy] being raw row 4y + dy).
+ * The raw column where network column x's 4x4 block starts, in a frame
+ * width raw pixels wide, mirrored for HFlip (see DenoiseBstm::hflip_), and
+ * the raw offset from there of the block's column dx.
  */
-inline void gatherSqrt(uint16_t *const rows[4], unsigned int x, const float *table, float *xf)
+template<bool HFlip>
+inline unsigned int blockColumn(unsigned int width, unsigned int x)
+{
+	return HFlip ? width - 4 - 4 * x : 4 * x;
+}
+
+template<bool HFlip>
+constexpr unsigned int columnOffset(unsigned int dx)
+{
+	return HFlip ? 3 - dx : dx;
+}
+
+/*
+ * The current frame's square root for the network pixel whose block starts
+ * at raw column col, in channel order, looked up from the raw values
+ * (rows[dy] being the raw row of the block's row dy).
+ */
+template<bool HFlip>
+inline void gatherSqrt(uint16_t *const rows[4], unsigned int col, const float *table, float *xf)
 {
 	for (unsigned int dy = 0; dy < 4; ++dy) {
-		const uint16_t *r = rows[dy] + 4 * x;
+		const uint16_t *r = rows[dy] + col;
 		for (unsigned int dx = 0; dx < 4; ++dx)
-			xf[rawToChannel(dx, dy)] = table[r[dx] >> kRawShift];
+			xf[rawToChannel(dx, dy)] = table[r[columnOffset<HFlip>(dx)] >> kRawShift];
 	}
 }
 
 #if defined(__ARM_NEON)
 /*
- * Square network pixel x's 16 channels (in [0, 1]) back to linear, scale to
- * 16 bits and write them over its 4x4 raw block. FCVTAU rounds to nearest
- * and saturates, and vqmovn_u32 saturates again to uint16, so no clamp is
- * needed. The 4 channel registers hold raw row dy's samples, in dx order,
- * as (see rawToChannel()):
+ * Square a network pixel's 16 channels (in [0, 1]) back to linear, scale to
+ * 16 bits and write them over its 4x4 raw block, at raw column col.
+ * FCVTAU rounds to nearest and saturates, and vqmovn_u32 saturates again to
+ * uint16, so no clamp is needed. The 4 channel registers hold raw row dy's
+ * samples, in dx order (reversed for HFlip), as (see rawToChannel()):
  * dy=0: zip1(c0-3, c4-7) = 0,4,1,5    dy=1: zip1(c8-11, c12-15) = 8,12,9,13
  * dy=2: zip2(c0-3, c4-7) = 2,6,3,7    dy=3: zip2(c8-11, c12-15) = 10,14,11,15
  */
-inline void writeRaw(uint16_t *const rows[4], unsigned int x, const float32x4x4_t &out)
+template<bool HFlip>
+inline void writeRaw(uint16_t *const rows[4], unsigned int col, const float32x4x4_t &out)
 {
 	const float32x4_t vRawMax = vdupq_n_f32(65535.0f);
 	float32x4_t lin[4];
@@ -254,8 +304,12 @@ inline void writeRaw(uint16_t *const rows[4], unsigned int x, const float32x4x4_
 		lin[i] = vmulq_f32(out.val[i], vmulq_f32(out.val[i], vRawMax));
 	const float32x4_t rowv[4] = { vzip1q_f32(lin[0], lin[1]), vzip1q_f32(lin[2], lin[3]),
 				      vzip2q_f32(lin[0], lin[1]), vzip2q_f32(lin[2], lin[3]) };
-	for (unsigned int dy = 0; dy < 4; ++dy)
-		vst1_u16(rows[dy] + 4 * x, vqmovn_u32(vcvtaq_u32_f32(rowv[dy])));
+	for (unsigned int dy = 0; dy < 4; ++dy) {
+		uint16x4_t v = vqmovn_u32(vcvtaq_u32_f32(rowv[dy]));
+		if constexpr (HFlip)
+			v = vrev64_u16(v);
+		vst1_u16(rows[dy] + col, v);
+	}
 }
 
 /*
@@ -303,13 +357,15 @@ inline int8x16_t quantisePrev(const float32x4x4_t &out, float32x4_t vInvScale, i
 			   vqmovn_s16(vcombine_s16(q16[2], q16[3])));
 }
 #else
-inline void writeRaw(uint16_t *const rows[4], unsigned int x, const float *out)
+template<bool HFlip>
+inline void writeRaw(uint16_t *const rows[4], unsigned int col, const float *out)
 {
 	for (unsigned int dy = 0; dy < 4; ++dy) {
-		uint16_t *r = rows[dy] + 4 * x;
+		uint16_t *r = rows[dy] + col;
 		for (unsigned int dx = 0; dx < 4; ++dx) {
 			const float o = out[rawToChannel(dx, dy)];
-			r[dx] = uint16_t(std::lround(std::min(o * (o * 65535.0f), 65535.0f)));
+			r[columnOffset<HFlip>(dx)] =
+				uint16_t(std::lround(std::min(o * (o * 65535.0f), 65535.0f)));
 		}
 	}
 }
@@ -378,6 +434,7 @@ int DenoiseBstm::Config::read(const libcamera::ValueNode &params)
 	model = findModel(model);
 	delegate = params["delegate"].get<std::string>(RPI_TEFLON_PATH);
 	floatFormat = params["float_format"].get<std::string>("bf16");
+	const std::string bayerOrder = params["model_bayer_order"].get<std::string>("");
 	sdnFactor = params["sdn_factor"].get<double>(0.0);
 	tdnFactor = params["tdn_factor"].get<double>(0.0);
 	cdnFactor = params["cdn_factor"].get<double>(0.0);
@@ -397,6 +454,15 @@ int DenoiseBstm::Config::read(const libcamera::ValueNode &params)
 		LOG(RPiDenoiseBstm, Error) << "\"model\" must be supplied";
 		return -EINVAL;
 	}
+
+	auto order = std::find_if(std::begin(kBayerOrders), std::end(kBayerOrders),
+				  [&](const auto &o) { return bayerOrder == o.first; });
+	if (order == std::end(kBayerOrders)) {
+		LOG(RPiDenoiseBstm, Error)
+			<< "\"model_bayer_order\" must be \"RGGB\", \"GRBG\", \"GBRG\" or \"BGGR\"";
+		return -EINVAL;
+	}
+	modelBayerOrder = order->second;
 
 	if (sdnFactor < 0.0 || tdnFactor < 0.0 || cdnFactor < 0.0) {
 		LOG(RPiDenoiseBstm, Error)
@@ -687,6 +753,22 @@ void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 	height_ = cameraMode.height;
 	active_ = false;
 
+	/* Mirror the frame to the model's Bayer order (see hflip_). */
+	if (!isBayer(cameraMode.bayerOrder)) {
+		LOG(RPiDenoiseBstm, Error)
+			<< "Raw images are " << bayerOrderName(cameraMode.bayerOrder)
+			<< ", not a Bayer order: can't denoise";
+		return;
+	}
+	const unsigned int flips = cameraMode.bayerOrder ^ config_.modelBayerOrder;
+	hflip_ = flips & 1;
+	vflip_ = flips & 2;
+	if ((hflip_ && width_ % 2) || (vflip_ && height_ % 2)) {
+		LOG(RPiDenoiseBstm, Error)
+			<< "Can't mirror a " << width_ << "x" << height_ << " Bayer frame";
+		return;
+	}
+
 	/* One network pixel per 4x4 raw block; tiled when larger than the model. */
 	packW_ = width_ / 4;
 	packH_ = height_ / 4;
@@ -761,8 +843,12 @@ void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 		}
 		return lo == hi ? std::to_string(lo) : std::to_string(lo) + "-" + std::to_string(hi);
 	};
+	const char *mirror = hflip_ ? (vflip_ ? "mirrored both ways" : "mirrored horizontally")
+				    : (vflip_ ? "mirrored vertically" : "not mirrored");
 	LOG(RPiDenoiseBstm, Info)
-		<< "Bayer " << width_ << "x" << height_ << " (" << packW_ << "x" << packH_
+		<< "Bayer " << bayerOrderName(cameraMode.bayerOrder) << " (model "
+		<< bayerOrderName(config_.modelBayerOrder) << ", " << mirror << ") "
+		<< width_ << "x" << height_ << " (" << packW_ << "x" << packH_
 		<< " network pixels) -> " << tilesX_.tileCount << "x" << tilesY_.tileCount
 		<< " tiles of " << netW_ << "x" << netH_ << ", overlaps " << overlaps(tilesX_, netW_)
 		<< " x " << overlaps(tilesY_, netH_) << " (minimum " << config_.minOverlap << "), "
@@ -891,18 +977,19 @@ bool DenoiseBstm::waitDone(unsigned int tiles)
 
 /*
  * Pack tile k's inputs. x: its part of the raw Bayer frame, network pixel
- * (x,y) of a tile at (ox,oy) covering raw rows [4(oy+y),4(oy+y)+4) and
- * columns [4(ox+x),4(ox+x)+4), raw offset (dx,dy) going to channel
- * rawToChannel(dx,dy), each sample being its square root from table:
+ * (x,y) of a tile at (ox,oy) covering rows [4(oy+y),4(oy+y)+4) and columns
+ * [4(ox+x),4(ox+x)+4) of the mirrored view (see hflip_), offset (dx,dy)
+ * going to channel rawToChannel(dx,dy), each sample being its square root
+ * from table:
  * quantised (xqTable_) for an int8 model, or in float (xfTable_). prev: its
  * part of the recurrent state, copied from prevQ_ (already quantised) for an
  * int8 model, or from prevFloat_. After a reset that is the encoding of zero.
  */
-template<typename T>
+template<typename T, bool HFlip>
 void DenoiseBstm::packTile(unsigned int k, const uint16_t *bayer16, unsigned int stridePx,
 			   const T *table)
 {
-	const unsigned int netW = netW_, packW = packW_;
+	const unsigned int netW = netW_, packW = packW_, width = width_;
 	const unsigned int validW = tilesX_.valid, validH = tilesY_.valid;
 	const unsigned int ox = tilesX_.tileStart[k % tilesX_.tileCount];
 	const unsigned int oy = tilesY_.tileStart[k / tilesX_.tileCount];
@@ -918,14 +1005,16 @@ void DenoiseBstm::packTile(unsigned int k, const uint16_t *bayer16, unsigned int
 		T *d = in + size_t(y) * netW * kChannels;
 		const uint16_t *rows[4];
 		for (unsigned int dy = 0; dy < 4; ++dy)
-			rows[dy] = bayer16 + size_t(4 * (oy + y) + dy) * stridePx + 4 * ox;
+			rows[dy] = bayer16 + size_t(rawRow(4 * (oy + y) + dy)) * stridePx;
 
 		for (unsigned int x = 0; x < validW; ++x) {
 			T *p = d + size_t(x) * kChannels;
+			const unsigned int col = blockColumn<HFlip>(width, ox + x);
 			for (unsigned int dy = 0; dy < 4; ++dy) {
-				const uint16_t *r = rows[dy] + 4 * x;
+				const uint16_t *r = rows[dy] + col;
 				for (unsigned int dx = 0; dx < 4; ++dx)
-					p[rawToChannel(dx, dy)] = table[r[dx] >> kRawShift];
+					p[rawToChannel(dx, dy)] =
+						table[r[columnOffset<HFlip>(dx)] >> kRawShift];
 			}
 		}
 
@@ -958,14 +1047,22 @@ void DenoiseBstm::packTile(unsigned int k, const uint16_t *bayer16, unsigned int
  * from alphaTable_, and the state is prev_ (16-bit fixed point), with
  * prevQ_ quantised from the unrounded result for the next frame's input.
  */
+template<bool HFlip>
 void DenoiseBstm::blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned int stridePx)
 {
-	const unsigned int netW = netW_, packW = packW_, nx = tilesX_.tileCount;
+	const unsigned int netW = netW_, packW = packW_, width = width_, nx = tilesX_.tileCount;
 	const unsigned int tx = k % nx, ty = k / nx;
 	const unsigned int x0 = tilesX_.blendStart[tx], x1 = tilesX_.blendStart[tx + 1];
 	const unsigned int y0 = tilesY_.blendStart[ty], y1 = tilesY_.blendStart[ty + 1];
-	/* config_.demo: write back the right half only (but update everything else). */
-	const unsigned int xStart = std::max(x0, config_.demo ? packW / 2 : 0);
+	/*
+	 * config_.demo: write back the raw buffer's right half only (but update
+	 * everything else), which is the left half of the view when mirrored.
+	 */
+	unsigned int xBegin = 0, xEnd = packW;
+	if (config_.demo && HFlip)
+		xEnd = packW - packW / 2;
+	else if (config_.demo)
+		xBegin = packW / 2;
 	const bool first = firstFrame_;
 	const float *xfTable = xfTable_.data();
 	const float *alphaTable = alphaTable_.data();
@@ -993,11 +1090,12 @@ void DenoiseBstm::blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned in
 		int8_t *qRow = prevQBuf + size_t(y) * packW * kChannels;
 		uint16_t *rows[4];
 		for (unsigned int dy = 0; dy < 4; ++dy)
-			rows[dy] = bayer16 + size_t(4 * y + dy) * stridePx;
+			rows[dy] = bayer16 + size_t(rawRow(4 * y + dy)) * stridePx;
 
 		for (unsigned int x = x0; x < x1; ++x) {
+			const unsigned int col = blockColumn<HFlip>(width, x);
 			alignas(16) float xf[kChannels];
-			gatherSqrt(rows, x, xfTable, xf);
+			gatherSqrt<HFlip>(rows, col, xfTable, xf);
 			uint16_t *p = pRow + size_t(x) * kChannels;
 			int8_t *pq = qRow + size_t(x) * kChannels;
 			const Cover cx = cover(tilesX_, x);
@@ -1075,8 +1173,8 @@ void DenoiseBstm::blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned in
 			}
 #endif
 
-			if (x >= xStart)
-				writeRaw(rows, x, out);
+			if (x >= xBegin && x < xEnd)
+				writeRaw<HFlip>(rows, col, out);
 		}
 	}
 }
@@ -1086,14 +1184,22 @@ void DenoiseBstm::blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned in
  * alpha is computed directly (one exp per network pixel and tile), and the
  * state is prevFloat_.
  */
+template<bool HFlip>
 void DenoiseBstm::blendRegionFloat(unsigned int k, uint16_t *bayer16, unsigned int stridePx)
 {
-	const unsigned int netW = netW_, packW = packW_, nx = tilesX_.tileCount;
+	const unsigned int netW = netW_, packW = packW_, width = width_, nx = tilesX_.tileCount;
 	const unsigned int tx = k % nx, ty = k / nx;
 	const unsigned int x0 = tilesX_.blendStart[tx], x1 = tilesX_.blendStart[tx + 1];
 	const unsigned int y0 = tilesY_.blendStart[ty], y1 = tilesY_.blendStart[ty + 1];
-	/* config_.demo: write back the right half only (but update everything else). */
-	const unsigned int xStart = std::max(x0, config_.demo ? packW / 2 : 0);
+	/*
+	 * config_.demo: write back the raw buffer's right half only (but update
+	 * everything else), which is the left half of the view when mirrored.
+	 */
+	unsigned int xBegin = 0, xEnd = packW;
+	if (config_.demo && HFlip)
+		xEnd = packW - packW / 2;
+	else if (config_.demo)
+		xBegin = packW / 2;
 	const bool first = firstFrame_;
 	const float *xfTable = xfTable_.data();
 	float *prevBuf = prevFloat_.data();
@@ -1108,11 +1214,12 @@ void DenoiseBstm::blendRegionFloat(unsigned int k, uint16_t *bayer16, unsigned i
 		float *pRow = prevBuf + size_t(y) * packW * kChannels;
 		uint16_t *rows[4];
 		for (unsigned int dy = 0; dy < 4; ++dy)
-			rows[dy] = bayer16 + size_t(4 * y + dy) * stridePx;
+			rows[dy] = bayer16 + size_t(rawRow(4 * y + dy)) * stridePx;
 
 		for (unsigned int x = x0; x < x1; ++x) {
+			const unsigned int col = blockColumn<HFlip>(width, x);
 			alignas(16) float xf[kChannels];
-			gatherSqrt(rows, x, xfTable, xf);
+			gatherSqrt<HFlip>(rows, col, xfTable, xf);
 			float *p = pRow + size_t(x) * kChannels;
 			const Cover cx = cover(tilesX_, x);
 
@@ -1184,8 +1291,8 @@ void DenoiseBstm::blendRegionFloat(unsigned int k, uint16_t *bayer16, unsigned i
 			std::copy(out, out + kChannels, p);
 #endif
 
-			if (x >= xStart)
-				writeRaw(rows, x, out);
+			if (x >= xBegin && x < xEnd)
+				writeRaw<HFlip>(rows, col, out);
 		}
 	}
 }
@@ -1268,10 +1375,14 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 
 	const Clock::time_point t0 = Clock::now();
 	for (unsigned int k = 0; k < nTiles; k++) {
-		if (isFloat_)
-			packTile(k, bayer16, stridePx, xfTable_.data());
+		if (isFloat_ && hflip_)
+			packTile<float, true>(k, bayer16, stridePx, xfTable_.data());
+		else if (isFloat_)
+			packTile<float, false>(k, bayer16, stridePx, xfTable_.data());
+		else if (hflip_)
+			packTile<int8_t, true>(k, bayer16, stridePx, xqTable_.data());
 		else
-			packTile(k, bayer16, stridePx, xqTable_.data());
+			packTile<int8_t, false>(k, bayer16, stridePx, xqTable_.data());
 		publishPacked(k + 1);
 	}
 	const double packMs = msSince(t0);
@@ -1287,10 +1398,14 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 			break;
 
 		tLast = Clock::now();
-		if (isFloat_)
-			blendRegionFloat(k, bayer16, stridePx);
+		if (isFloat_ && hflip_)
+			blendRegionFloat<true>(k, bayer16, stridePx);
+		else if (isFloat_)
+			blendRegionFloat<false>(k, bayer16, stridePx);
+		else if (hflip_)
+			blendRegionInt8<true>(k, bayer16, stridePx);
 		else
-			blendRegionInt8(k, bayer16, stridePx);
+			blendRegionInt8<false>(k, bayer16, stridePx);
 		blendMs += msSince(tLast);
 	}
 	/* What's left once the last tile is done: blending its own region. */

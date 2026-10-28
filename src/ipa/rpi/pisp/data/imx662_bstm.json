@@ -121,6 +121,7 @@
                 "fast-model": "imx662_32_2e13w_16x80x80_g32-192_c025_d100_int8.tflite",
                 "float-model": "imx662_32_2e13w_16x60x60_g32-192_c025_d100_fp32.tflite",
                 "model": "slow-model",
+                "model_bayer_order": "RGGB",
                 "gain_threshold_on": 32.0,
                 "gain_threshold_off": 24.0,
                 "float_format": "bf16",
