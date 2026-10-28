@@ -37,6 +37,8 @@ struct BufferIds {
 
 struct ConfigParams {
 	uint32 transform;
+	/* Raw image Bayer order, as a BayerFormat::Order value */
+	uint32 bayerOrder;
 	libcamera.ControlInfoMap sensorControls;
 	libcamera.ControlInfoMap ispControls;
 	libcamera.ControlInfoMap lensControls;

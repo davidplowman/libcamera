@@ -10,6 +10,8 @@
 
 #include <libcamera/base/utils.h>
 
+#include "libcamera/internal/bayer_format.h"
+
 /*
  * Description of a "camera mode", holding enough information for control
  * algorithms to adapt their behaviour to the different modes of the camera,
@@ -43,6 +45,8 @@ struct CameraMode {
 	libcamera::utils::Duration maxFrameDuration;
 	/* any camera transform *not* reflected already in the camera tuning */
 	libcamera::Transform transform;
+	/* raw image Bayer order */
+	libcamera::BayerFormat::Order bayerOrder;
 	/* minimum and maximum frame lengths in units of lines */
 	uint32_t minFrameLength;
 	uint32_t maxFrameLength;

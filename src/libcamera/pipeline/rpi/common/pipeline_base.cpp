@@ -1244,6 +1244,11 @@ int CameraData::configureIPA(const CameraConfiguration *config, ipa::RPi::Config
 	Transform transform = config->orientation / Orientation::Rotate0;
 	params.transform = static_cast<unsigned int>(transform);
 
+	/* The Bayer order the raw images actually have, after the sensor's flips. */
+	const RPiCameraConfiguration *rpiConfig =
+		static_cast<const RPiCameraConfiguration *>(config);
+	params.bayerOrder = sensor_->bayerOrder(rpiConfig->combinedTransform_);
+
 	/* Ready the IPA - it must know about the sensor resolution. */
 	ret = ipa_->configure(sensorInfo_, params, result);
 	if (ret < 0) {
