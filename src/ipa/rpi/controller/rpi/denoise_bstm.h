@@ -21,6 +21,11 @@
  * it's packed, and mirrored back as the result is written, so the model always
  * sees its own order. The tiles and the recurrent state are all in this
  * mirrored view, which costs nothing extra.
+ *
+ * Optionally, the previous result is aligned with the current frame before
+ * it's used, by a global translation of whole Bayer quads (2 raw pixels, so
+ * the Bayer phase is kept) estimated from 1D row and column profiles of the
+ * two frames (see temporal_host_motion.md).
  */
 #pragma once
 
@@ -75,6 +80,19 @@ public:
 		std::vector<float> pixelWeight; /* weight of that pixel in that tile */
 	};
 
+	/*
+	 * A shift of the previous result along one axis, by whole Bayer quads
+	 * ("plane" pixels, two per network pixel along each axis). plane[p] is
+	 * the plane position that position p reads from, clamped to the frame,
+	 * so that the exposed edge repeats the border. whole[n] is the network
+	 * pixel that network pixel n reads in its entirety, when both its plane
+	 * positions read the two of a single network pixel, in order, or -1.
+	 */
+	struct ShiftMap {
+		std::vector<unsigned int> plane;
+		std::vector<int> whole;
+	};
+
 private:
 	bool checkTensor(const TfLiteTensor *t, const char *what, int channels, bool &isInt8,
 			 float &scale, int &zp);
@@ -83,7 +101,13 @@ private:
 	void checkGain(double analogueGain);
 	void checkForReset(const DeviceStatus &deviceStatus);
 	template<typename T, bool HFlip>
-	void packTile(unsigned int k, const uint16_t *bayer16, unsigned int stridePx, const T *table);
+	void packTileX(unsigned int k, const uint16_t *bayer16, unsigned int stridePx, const T *table);
+	template<typename T>
+	void packTilePrev(unsigned int k);
+	void addProfiles(float rowSum[2], std::vector<float> &col, unsigned int y, unsigned int x,
+			 const float lum[4]);
+	void addRowSums(std::vector<float> &row, unsigned int y, const float rowSum[2]);
+	void estimateMotion();
 	template<bool HFlip>
 	void blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned int stridePx);
 	template<bool HFlip>
@@ -199,6 +223,20 @@ private:
 		double gainThresholdOff = 24.0;
 
 		/*
+		 * Global motion compensation: the largest motion from one frame to
+		 * the next searched for, horizontally and vertically, in raw pixels
+		 * (even, as the previous result is only ever shifted by whole Bayer
+		 * quads). 0 leaves that axis uncompensated; with both 0 there's no
+		 * motion compensation at all. An estimate is only used when its
+		 * best match cost is below the median cost of all the shifts
+		 * searched by at least motionThreshold times that median, and isn't
+		 * at the limit of the search; otherwise that axis isn't shifted.
+		 */
+		unsigned int motionRangeX = 0;
+		unsigned int motionRangeY = 0;
+		double motionThreshold = 0.1;
+
+		/*
 		 * Debug only: write the raw frame before and after denoising, for
 		 * the first dumpFrames frames after each change of camera mode, to
 		 * dumpDir (as <dir>/in_NNNN.raw and out_NNNN.raw, packed uint16,
@@ -258,6 +296,38 @@ private:
 	bool vflip_ = false;
 	/* The raw row holding row r of the mirrored view. */
 	unsigned int rawRow(unsigned int r) const { return vflip_ ? height_ - 1 - r : r; }
+
+	/*
+	 * Global motion compensation, all in the mirrored view and in plane
+	 * pixels (one per Bayer quad; the frame is 2 * packW_ x 2 * packH_ of
+	 * them). motionX_/motionY_ are the search ranges for this mode (0: that
+	 * axis is never shifted). shiftX_/shiftY_ are this frame's shifts:
+	 * content at (P, Q) in the previous result is at (P + shiftY_,
+	 * Q + shiftX_) in the current frame. When either is non-zero, shifted_
+	 * is set and shiftMapX_/shiftMapY_ say where each position reads from.
+	 */
+	unsigned int motionX_ = 0;
+	unsigned int motionY_ = 0;
+	int shiftX_ = 0;
+	int shiftY_ = 0;
+	bool shifted_ = false;
+	ShiftMap shiftMapX_;
+	ShiftMap shiftMapY_;
+
+	/*
+	 * The square-rooted luminance profiles (the sum of each Bayer quad's
+	 * four samples, summed along each row and column, away from the edges
+	 * that motion moves content across): the current frame's, built as it's
+	 * packed (for an int8 model, in units of the x input's scale), and the
+	 * previous result's, built as it's blended, ready for the next frame.
+	 * rowCur_/rowPrev_ are only needed for motionY_ and colCur_/colPrev_ for
+	 * motionX_. prevProfilesValid_ is cleared by reset().
+	 */
+	std::vector<float> rowCur_;
+	std::vector<float> colCur_;
+	std::vector<float> rowPrev_;
+	std::vector<float> colPrev_;
+	bool prevProfilesValid_ = false;
 
 	/*
 	 * Every tile's x and prev inputs and r and a outputs, allocated once
@@ -321,11 +391,19 @@ private:
 	 * finer than the network's int8 input, and half the memory traffic of
 	 * float. prevQ_ is the same state quantised to the network's int8 prev
 	 * input, made by the blend from the unrounded result and copied into
-	 * each tile by packTile(). Float model: prevFloat_.
+	 * each tile by packTilePrev(). Float model: prevFloat_.
+	 *
+	 * With motion compensation, a shifted frame reads the state from
+	 * elsewhere than it writes it, so it can't be updated in place: the
+	 * previous state is swapped into prevLast_ (prevFloatLast_), and read
+	 * from there while the blend writes all of prev_ (prevFloat_). prevQ_
+	 * stays as it is, as every tile has been packed before any is blended.
 	 */
 	std::vector<uint16_t> prev_;
 	std::vector<int8_t> prevQ_;
 	std::vector<float> prevFloat_;
+	std::vector<uint16_t> prevLast_;
+	std::vector<float> prevFloatLast_;
 	bool firstFrame_ = true;
 
 	/* Whether the network is running, by Config::gainThresholdOn/Off. */

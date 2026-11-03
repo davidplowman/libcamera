@@ -129,6 +129,8 @@
                 "cpu": false,
                 "cpu_threads": 3,
                 "reset_ratio": 2.0,
+                "motion_range_x": 64,
+                "motion_range_y": 32,
                 "sdn_factor": 0.0,
                 "tdn_factor": 0.0,
                 "cdn_factor": 1.0,
