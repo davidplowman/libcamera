@@ -104,6 +104,8 @@ private:
 	void packTileX(unsigned int k, const uint16_t *bayer16, unsigned int stridePx, const T *table);
 	template<typename T>
 	void packTilePrev(unsigned int k);
+	template<bool HFlip>
+	void profileFrame(const uint16_t *bayer16, unsigned int stridePx);
 	void addProfiles(float rowSum[2], std::vector<float> &col, unsigned int y, unsigned int x,
 			 const float lum[4]);
 	void addRowSums(std::vector<float> &row, unsigned int y, const float rowSum[2]);
@@ -237,6 +239,15 @@ private:
 		double motionThreshold = 0.1;
 
 		/*
+		 * The current frame's profiles are read from the raw frame before
+		 * any tile is packed, which delays inference, so they're
+		 * subsampled: the row profile sums every motionStep-th Bayer quad
+		 * along each row, and the column profile every motionStep-th quad
+		 * down each column. 1 sums them all.
+		 */
+		unsigned int motionStep = 4;
+
+		/*
 		 * Debug only: write the raw frame before and after denoising, for
 		 * the first dumpFrames frames after each change of camera mode, to
 		 * dumpDir (as <dir>/in_NNNN.raw and out_NNNN.raw, packed uint16,
@@ -317,17 +328,24 @@ private:
 	/*
 	 * The square-rooted luminance profiles (the sum of each Bayer quad's
 	 * four samples, summed along each row and column, away from the edges
-	 * that motion moves content across): the current frame's, built as it's
-	 * packed (for an int8 model, in units of the x input's scale), and the
-	 * previous result's, built as it's blended, ready for the next frame.
-	 * rowCur_/rowPrev_ are only needed for motionY_ and colCur_/colPrev_ for
-	 * motionX_. prevProfilesValid_ is cleared by reset().
+	 * that motion moves content across): the current frame's, read from the
+	 * raw frame by profileFrame(), and the previous result's, built as it's
+	 * blended, ready for the next frame. rowCur_/rowPrev_ are only needed for
+	 * motionY_ and colCur_/colPrev_ for motionX_. prevProfilesValid_ is
+	 * cleared by reset().
+	 *
+	 * Both frames' profiles sample the same quads: the row profiles those in
+	 * the columns q with profileCols_[q] set (every Config::motionStep-th,
+	 * from motionX_ to the last motionX_ from the far edge), the column
+	 * profiles those in the rows with profileRows_ set, likewise.
 	 */
 	std::vector<float> rowCur_;
 	std::vector<float> colCur_;
 	std::vector<float> rowPrev_;
 	std::vector<float> colPrev_;
 	bool prevProfilesValid_ = false;
+	std::vector<uint8_t> profileCols_;
+	std::vector<uint8_t> profileRows_;
 
 	/*
 	 * Every tile's x and prev inputs and r and a outputs, allocated once
