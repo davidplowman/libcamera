@@ -23,12 +23,15 @@
  * mirrored view, which costs nothing extra.
  *
  * Optionally, the previous result is aligned with the current frame before
- * it's used, by a global translation of whole Bayer quads (2 raw pixels, so
- * the Bayer phase is kept) estimated from 1D row and column profiles of the
- * two frames (see temporal_host_motion.md).
+ * it's used, by a global translation and optionally a rotation, estimated
+ * from 1D row and column profiles of the two halves of the frame (see
+ * global_motion.md). A translation moves whole Bayer quads (2 raw pixels, so
+ * the Bayer phase is kept), and a rotation is applied per Bayer quad, by
+ * nearest neighbour.
  */
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -41,6 +44,7 @@
 #include <tensorflow/lite/model.h>
 
 #include "../denoise_algorithm.h"
+#include "global_motion.h"
 
 struct DeviceStatus;
 
@@ -93,6 +97,22 @@ public:
 		std::vector<int> whole;
 	};
 
+	/*
+	 * A rotation and translation of the previous result, by whole Bayer
+	 * quads. Output quad (p, q) (plane row and column) reads the quad at
+	 * column (rowX[p] + q * dX) >> 16 and row (rowY[p] + q * dY) >> 16 (16.16
+	 * fixed point, with the rounding already added in), clamped to
+	 * [0, maxQ] and [0, maxP], so that the exposed edges repeat the border.
+	 */
+	struct RotationMap {
+		std::vector<int32_t> rowX;
+		std::vector<int32_t> rowY;
+		int32_t dX = 0;
+		int32_t dY = 0;
+		int maxQ = 0;
+		int maxP = 0;
+	};
+
 private:
 	bool checkTensor(const TfLiteTensor *t, const char *what, int channels, bool &isInt8,
 			 float &scale, int &zp);
@@ -105,11 +125,9 @@ private:
 	template<typename T>
 	void packTilePrev(unsigned int k);
 	template<bool HFlip>
-	void profileFrame(const uint16_t *bayer16, unsigned int stridePx);
-	void addProfiles(float rowSum[2], std::vector<float> &col, unsigned int y, unsigned int x,
-			 const float lum[4]);
-	void addRowSums(std::vector<float> &row, unsigned int y, const float rowSum[2]);
+	void workFrame(const uint16_t *bayer16, unsigned int stridePx);
 	void estimateMotion();
+	void buildMotionMaps(const GlobalMotionResult &motion);
 	template<bool HFlip>
 	void blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned int stridePx);
 	template<bool HFlip>
@@ -225,27 +243,32 @@ private:
 		double gainThresholdOff = 24.0;
 
 		/*
-		 * Global motion compensation: the largest motion from one frame to
-		 * the next searched for, horizontally and vertically, in raw pixels
-		 * (even, as the previous result is only ever shifted by whole Bayer
-		 * quads). 0 leaves that axis uncompensated; with both 0 there's no
-		 * motion compensation at all. An estimate is only used when its
-		 * best match cost is below the median cost of all the shifts
-		 * searched by at least motionThreshold times that median, and isn't
-		 * at the limit of the search; otherwise that axis isn't shifted.
+		 * Global motion compensation (see global_motion.h): the largest
+		 * motion from one frame to the next searched for, horizontally and
+		 * vertically, in raw pixels (even, as the previous result is only
+		 * ever shifted by whole Bayer quads; the search itself is in
+		 * working pixels of 4 raw pixels, so these are rounded up to
+		 * those). 0 leaves that axis uncompensated; with both 0 there's no
+		 * motion compensation at all.
 		 */
 		unsigned int motionRangeX = 0;
 		unsigned int motionRangeY = 0;
-		double motionThreshold = 0.1;
 
 		/*
-		 * The current frame's profiles are read from the raw frame before
-		 * any tile is packed, which delays inference, so they're
-		 * subsampled: the row profile sums every motionStep-th Bayer quad
-		 * along each row, and the column profile every motionStep-th quad
-		 * down each column. 1 sums them all.
+		 * Estimate a rotation about the centre of the frame as well as the
+		 * translation; needs both motionRangeX and motionRangeY.
 		 */
-		unsigned int motionStep = 4;
+		bool motionRotation = false;
+
+		/*
+		 * The motions measured (the translations of the left and right
+		 * halves of the frame, the mean of the two, and with
+		 * motionRotation a rotation) are only candidates: one is used only
+		 * if it aligns the images better than no motion (and a rotation
+		 * better than the best translation) by at least this fraction (see
+		 * GlobalMotionConfig::checkMargin).
+		 */
+		double motionCheckMargin = 0.02;
 
 		/*
 		 * Debug only: write the raw frame before and after denoising, for
@@ -326,26 +349,29 @@ private:
 	ShiftMap shiftMapY_;
 
 	/*
-	 * The square-rooted luminance profiles (the sum of each Bayer quad's
-	 * four samples, summed along each row and column, away from the edges
-	 * that motion moves content across): the current frame's, read from the
-	 * raw frame by profileFrame(), and the previous result's, built as it's
-	 * blended, ready for the next frame. rowCur_/rowPrev_ are only needed for
-	 * motionY_ and colCur_/colPrev_ for motionX_. prevProfilesValid_ is
-	 * cleared by reset().
+	 * The motion is estimated (see globalMotion_; rotation_ if that includes
+	 * a rotation) from working images, one float per network pixel: the sum
+	 * of its 16 raw samples, linear. workCur_ is the current frame's, made
+	 * from the raw frame by workFrame() before any tile is packed. workPrev_
+	 * is the previous result's, squared back to linear (the same scale as
+	 * raw), made by the blend, and only valid with workPrevValid_ (cleared
+	 * by reset()). The estimate reads workPrev_ before any tile is blended,
+	 * so the blend can write the next frame's straight into it.
 	 *
-	 * Both frames' profiles sample the same quads: the row profiles those in
-	 * the columns q with profileCols_[q] set (every Config::motionStep-th,
-	 * from motionX_ to the last motionX_ from the far edge), the column
-	 * profiles those in the rows with profileRows_ set, likewise.
+	 * A frame whose estimated rotation moves no quad by as much as half a
+	 * quad is treated as a translation (shifted_ alone, by shiftX_/shiftY_).
+	 * Otherwise rotated_ is also set, and rotationMap_ says where each
+	 * quad reads from. rotationRadius_ is the furthest quad centre from the
+	 * frame's centre, in quads.
 	 */
-	std::vector<float> rowCur_;
-	std::vector<float> colCur_;
-	std::vector<float> rowPrev_;
-	std::vector<float> colPrev_;
-	bool prevProfilesValid_ = false;
-	std::vector<uint8_t> profileCols_;
-	std::vector<uint8_t> profileRows_;
+	bool rotation_ = false;
+	GlobalMotionConfig globalMotion_;
+	std::vector<float> workCur_;
+	std::vector<float> workPrev_;
+	bool workPrevValid_ = false;
+	bool rotated_ = false;
+	RotationMap rotationMap_;
+	double rotationRadius_ = 0.0;
 
 	/*
 	 * Every tile's x and prev inputs and r and a outputs, allocated once
@@ -411,7 +437,7 @@ private:
 	 * input, made by the blend from the unrounded result and copied into
 	 * each tile by packTilePrev(). Float model: prevFloat_.
 	 *
-	 * With motion compensation, a shifted frame reads the state from
+	 * With motion compensation, a shifted (or rotated) frame reads the state from
 	 * elsewhere than it writes it, so it can't be updated in place: the
 	 * previous state is swapped into prevLast_ (prevFloatLast_), and read
 	 * from there while the blend writes all of prev_ (prevFloat_). prevQ_
@@ -446,6 +472,9 @@ private:
 	bool npuError_ = false;
 	bool npuExit_ = false;
 	double npuMs_ = 0.0; /* time spent in Invoke() this frame */
+	/* When the first tile's Invoke() started and the last one's ended, this frame. */
+	std::chrono::steady_clock::time_point npuFirstStart_;
+	std::chrono::steady_clock::time_point npuLastEnd_;
 };
 
 } /* namespace RPiController */

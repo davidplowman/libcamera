@@ -13,7 +13,6 @@
 #include <errno.h>
 #include <fstream>
 #include <iomanip>
-#include <limits>
 #include <sstream>
 #include <stdlib.h>
 #include <string.h>
@@ -437,58 +436,67 @@ inline const T *shiftedPrev(const T *state, unsigned int packW, const DenoiseBst
 	return tmp;
 }
 
-struct MotionMatch {
-	int shift; /* the shift used, 0 if the estimate was rejected */
-	int best; /* the best match, whether used or not */
-	float confidence; /* (median cost - best cost) / median cost */
-	const char *rejected; /* why the estimate wasn't used, or nullptr */
-};
+/*
+ * The map for a rotation by theta and a translation by (tx, ty) quads, in a
+ * frame of packW x packH network pixels (2 packW x 2 packH quads): output
+ * quad p, measured from the frame's centre, reads the quad nearest
+ * R^T (p - t).
+ */
+void buildRotationMap(DenoiseBstm::RotationMap &map, unsigned int packW, unsigned int packH,
+		      double tx, double ty, double theta)
+{
+	const int planeW = 2 * packW, planeH = 2 * packH;
+	const double cx = (planeW - 1) / 2.0, cy = (planeH - 1) / 2.0;
+	const double c = std::cos(theta), s = std::sin(theta);
+	auto fixed = [](double v) { return int32_t(std::lround(v * 65536.0)); };
+
+	map.rowX.resize(planeH);
+	map.rowY.resize(planeH);
+	const double u0 = -cx - tx; /* column 0, from the centre, less the translation */
+	for (int p = 0; p < planeH; p++) {
+		const double v = p - cy - ty;
+		map.rowX[p] = fixed(c * u0 + s * v + cx) + 0x8000;
+		map.rowY[p] = fixed(-s * u0 + c * v + cy) + 0x8000;
+	}
+	map.dX = fixed(c);
+	map.dY = fixed(-s);
+	map.maxQ = planeW - 1;
+	map.maxP = planeH - 1;
+}
 
 /*
- * Find the shift m in [-range, range] (with range > 0) that best matches
- * the current frame's profile cur with the previous result's prev: content at prev[k] being at cur[k + m]. Both are compared
- * as gradients, so that a change of overall brightness doesn't matter, over
- * the same positions for every m, so that the costs (sums of absolute
- * differences) are directly comparable. Ties go to the smaller shift.
+ * As shiftedPrev(), for a rotation: the four quads of network pixel (x, y)
+ * each read wherever map says, the whole network pixel being returned
+ * directly when that's where they all read from, in order.
  */
-MotionMatch matchProfiles(const std::vector<float> &cur, const std::vector<float> &prev,
-			  unsigned int range, double threshold)
+template<typename T>
+inline const T *rotatedPrev(const T *state, unsigned int packW, const DenoiseBstm::RotationMap &map,
+			    unsigned int y, unsigned int x, T *tmp)
 {
-	const int n = int(cur.size()) - 1, m0 = int(range);
-	std::vector<float> gCur(n), gPrev(n);
-	for (int k = 0; k < n; k++) {
-		gCur[k] = cur[k + 1] - cur[k];
-		gPrev[k] = prev[k + 1] - prev[k];
-	}
-
-	std::vector<float> cost(2 * range + 1);
-	int best = 0;
-	float bestCost = std::numeric_limits<float>::infinity();
-	for (int m = -m0; m <= m0; m++) {
-		float c = 0.0f;
-		for (int k = m0; k <= n - 1 - m0; k++)
-			c += std::abs(gCur[k] - gPrev[k - m]);
-		cost[m + m0] = c;
-		if (c < bestCost || (c == bestCost && std::abs(m) < std::abs(best))) {
-			best = m;
-			bestCost = c;
+	int p[2][2], q[2][2];
+	for (unsigned int i = 0; i < 2; i++) {
+		const int32_t rx = map.rowX[2 * y + i], ry = map.rowY[2 * y + i];
+		for (unsigned int j = 0; j < 2; j++) {
+			const int32_t c = int32_t(2 * x + j);
+			q[i][j] = std::clamp((rx + c * map.dX) >> 16, 0, map.maxQ);
+			p[i][j] = std::clamp((ry + c * map.dY) >> 16, 0, map.maxP);
 		}
 	}
 
-	std::nth_element(cost.begin(), cost.begin() + m0, cost.end());
-	const float median = cost[m0];
-	const float confidence = median > 0.0f ? (median - bestCost) / median : 0.0f;
+	if (p[0][0] % 2 == 0 && q[0][0] % 2 == 0 && p[0][1] == p[0][0] && q[0][1] == q[0][0] + 1 &&
+	    p[1][0] == p[0][0] + 1 && q[1][0] == q[0][0] && p[1][1] == p[0][0] + 1 &&
+	    q[1][1] == q[0][0] + 1)
+		return state + (size_t(p[0][0] >> 1) * packW + (q[0][0] >> 1)) * kChannels;
 
-	MotionMatch match = { best, best, confidence, nullptr };
-	if (!(median > 0.0f))
-		match.rejected = "no detail";
-	else if (std::abs(best) == m0)
-		match.rejected = "at the search limit";
-	else if (confidence < threshold)
-		match.rejected = "low confidence";
-	if (match.rejected)
-		match.shift = 0;
-	return match;
+	for (unsigned int i = 0; i < 2; i++) {
+		for (unsigned int j = 0; j < 2; j++) {
+			const T *s = state + (size_t(p[i][j] >> 1) * packW + (q[i][j] >> 1)) * kChannels +
+				     (p[i][j] & 1) * 2 + (q[i][j] & 1);
+			for (unsigned int c = 0; c < 4; c++)
+				tmp[c * 4 + i * 2 + j] = s[c * 4];
+		}
+	}
+	return tmp;
 }
 
 } /* namespace */
@@ -548,8 +556,8 @@ int DenoiseBstm::Config::read(const libcamera::ValueNode &params)
 	gainThresholdOff = params["gain_threshold_off"].get<double>(24.0);
 	const int rangeX = params["motion_range_x"].get<int>(0);
 	const int rangeY = params["motion_range_y"].get<int>(0);
-	motionThreshold = params["motion_threshold"].get<double>(0.1);
-	motionStep = params["motion_profile_step"].get<unsigned int>(4);
+	motionRotation = params["motion_rotation"].get<bool>(false);
+	motionCheckMargin = params["motion_check_margin"].get<double>(0.02);
 
 	dumpDir = params["dump_dir"].get<std::string>("");
 	dumpFrames = params["dump_frames"].get<unsigned int>(0);
@@ -599,13 +607,8 @@ int DenoiseBstm::Config::read(const libcamera::ValueNode &params)
 	motionRangeX = rangeX;
 	motionRangeY = rangeY;
 
-	if (!motionStep) {
-		LOG(RPiDenoiseBstm, Error) << "\"motion_profile_step\" must be at least 1";
-		return -EINVAL;
-	}
-
-	if (motionThreshold < 0.0) {
-		LOG(RPiDenoiseBstm, Error) << "\"motion_threshold\" must not be negative";
+	if (motionCheckMargin < 0.0 || motionCheckMargin >= 1.0) {
+		LOG(RPiDenoiseBstm, Error) << "\"motion_check_margin\" must be at least 0 and less than 1";
 		return -EINVAL;
 	}
 
@@ -968,22 +971,28 @@ void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 	const bool motion = motionX_ || motionY_;
 	prevLast_.assign(motion && !isFloat_ ? state : 0, 0);
 	prevFloatLast_.assign(motion && isFloat_ ? state : 0, 0.0f);
-	rowCur_.assign(motionY_ ? 2 * packH_ : 0, 0.0f);
-	rowPrev_.assign(motionY_ ? 2 * packH_ : 0, 0.0f);
-	colCur_.assign(motionX_ ? 2 * packW_ : 0, 0.0f);
-	colPrev_.assign(motionX_ ? 2 * packW_ : 0, 0.0f);
 	shiftX_ = shiftY_ = 0;
 	shifted_ = false;
 
-	/* The quads the profiles sample (see profileFrame()). */
-	auto sampled = [&](unsigned int size, unsigned int margin) {
-		std::vector<uint8_t> use(motion ? size : 0, 0);
-		for (unsigned int i = margin; motion && i < size - margin; i += config_.motionStep)
-			use[i] = 1;
-		return use;
-	};
-	profileCols_ = sampled(2 * packW_, motionX_);
-	profileRows_ = sampled(2 * packH_, motionY_);
+	/*
+	 * Each half's search ranges are the motion ranges, in working pixels
+	 * (4 raw pixels, or 2 plane pixels, each), rounded up; 0 for an axis
+	 * that isn't compensated. The checks above leave each half at least
+	 * twice as wide as its horizontal search, and the frame at least twice
+	 * as high as its vertical one.
+	 */
+	rotation_ = config_.motionRotation && motionX_ && motionY_;
+	if (config_.motionRotation && motion && !rotation_)
+		LOG(RPiDenoiseBstm, Warning)
+			<< "Motion rotation needs both motion ranges: estimating translation only";
+	globalMotion_.maxShiftX = (motionX_ + 1) / 2;
+	globalMotion_.maxShiftY = (motionY_ + 1) / 2;
+	globalMotion_.rotation = rotation_;
+	globalMotion_.checkMargin = config_.motionCheckMargin;
+	workCur_.assign(motion ? size_t(packW_) * packH_ : 0, 0.0f);
+	workPrev_.assign(motion ? size_t(packW_) * packH_ : 0, 0.0f);
+	rotationRadius_ = std::hypot(packW_ - 0.5, packH_ - 0.5);
+	rotated_ = false;
 
 	dumpCount_ = 0;
 	active_ = true;
@@ -1014,7 +1023,7 @@ void DenoiseBstm::switchMode(CameraMode const &cameraMode, [[maybe_unused]] Meta
 	if (motion)
 		LOG(RPiDenoiseBstm, Info)
 			<< "Motion compensation up to " << 2 * motionX_ << "x" << 2 * motionY_
-			<< " raw pixels";
+			<< " raw pixels" << (rotation_ ? ", with rotation" : "");
 }
 
 void DenoiseBstm::setMode([[maybe_unused]] DenoiseMode mode)
@@ -1033,7 +1042,7 @@ void DenoiseBstm::reset()
 	std::fill(prevFloat_.begin(), prevFloat_.end(), 0.0f);
 
 	firstFrame_ = true;
-	prevProfilesValid_ = false;
+	workPrevValid_ = false;
 }
 
 /*
@@ -1100,10 +1109,13 @@ void DenoiseBstm::npuLoop()
 		for (unsigned int i = 0; i < 4; i++)
 			interpreter_->tensor(idx[i])->data.raw = reinterpret_cast<char *>(buf[i]);
 		const bool ok = interpreter_->Invoke() == kTfLiteOk;
-		const double ms = msSince(t0);
+		const Clock::time_point t1 = Clock::now();
 
 		lock.lock();
-		npuMs_ += ms;
+		npuMs_ += std::chrono::duration<double, std::milli>(t1 - t0).count();
+		if (k == 0)
+			npuFirstStart_ = t0;
+		npuLastEnd_ = t1;
 		if (ok)
 			done_++;
 		else
@@ -1178,8 +1190,8 @@ void DenoiseBstm::packTileX(unsigned int k, const uint16_t *bayer16, unsigned in
 /*
  * Pack tile k's prev input: its part of the recurrent state, copied from
  * prevQ_ (already quantised) for an int8 model, or from prevFloat_ (or
- * prevFloatLast_, where estimateMotion() has swapped it), and shifted by this
- * frame's motion. After a reset that is the encoding of zero.
+ * prevFloatLast_, where estimateMotion() has swapped it), and shifted or
+ * rotated by this frame's motion. After a reset that is the encoding of zero.
  */
 template<typename T>
 void DenoiseBstm::packTilePrev(unsigned int k)
@@ -1207,136 +1219,144 @@ void DenoiseBstm::packTilePrev(unsigned int k)
 
 		for (unsigned int x = 0; x < validW; ++x) {
 			alignas(16) T tmp[kChannels];
-			const T *s = shiftedPrev(state, packW, shiftMapY_, shiftMapX_, oy + y, ox + x, tmp);
+			const T *s = rotated_ ? rotatedPrev(state, packW, rotationMap_, oy + y, ox + x, tmp)
+					      : shiftedPrev(state, packW, shiftMapY_, shiftMapX_, oy + y,
+							    ox + x, tmp);
 			std::copy(s, s + kChannels, d + size_t(x) * kChannels);
 		}
 	}
 }
 
 /*
- * Add network pixel (x, y)'s four Bayer quad luminances, lum[i*2 + j] being
- * that of plane position (2y + i, 2x + j), to a frame's profiles: to the
- * column profile col, and to rowSum[i], the caller's running sums for the
- * row profile's entries 2y + i (kept apart so that each network pixel
- * doesn't wait on the last one's addition to memory), which addRowSums()
- * then adds in. Only the quads that profileFrame() samples (see
- * profileCols_ and profileRows_) are added, so that the two frames' profiles
- * are comparable.
- */
-inline void DenoiseBstm::addProfiles(float rowSum[2], std::vector<float> &col, unsigned int y,
-				     unsigned int x, const float lum[4])
-{
-	for (unsigned int i = 0; i < 2; i++) {
-		const unsigned int p = 2 * y + i;
-		for (unsigned int j = 0; j < 2; j++) {
-			const unsigned int q = 2 * x + j;
-			if (profileCols_[q])
-				rowSum[i] += lum[i * 2 + j];
-			if (motionX_ && profileRows_[p])
-				col[q] += lum[i * 2 + j];
-		}
-	}
-}
-
-inline void DenoiseBstm::addRowSums(std::vector<float> &row, unsigned int y, const float rowSum[2])
-{
-	if (motionY_) {
-		row[2 * y] += rowSum[0];
-		row[2 * y + 1] += rowSum[1];
-	}
-}
-
-/*
- * Build the current frame's profiles straight from the raw frame, in float
- * square-root space (from xfTable_), before any tile is packed, so that the
- * motion is known before inference starts. Each quad's luminance is the sum
- * of its four samples, which mirroring only reorders: quad (p, q) of the
- * mirrored view is raw rows rawRow(2p) and rawRow(2p + 1), and raw columns
- * 2q and 2q + 1 counted from the left, or from the right for HFlip. Only the
- * quads in profileCols_ (for the row profile) and profileRows_ (for the
- * column profile) are read: the row profile reads every row, but only every
- * motionStep-th column, and vice versa.
+ * Build the current frame's working image (see workCur_)
+ * straight from the raw frame, before any tile is packed: each network
+ * pixel's 16 raw samples summed. Network pixel x of the mirrored view is
+ * raw block b = x counted from the left, or b = packW_ - 1 - x counted from
+ * the left of the last whole block for HFlip (see blockColumn()), and the
+ * sum doesn't depend on the order of the rows or columns within a block.
  */
 template<bool HFlip>
-void DenoiseBstm::profileFrame(const uint16_t *bayer16, unsigned int stridePx)
+void DenoiseBstm::workFrame(const uint16_t *bayer16, unsigned int stridePx)
 {
-	const unsigned int planeW = 2 * packW_, planeH = 2 * packH_, width = width_;
-	const unsigned int step = config_.motionStep;
-	const float *table = xfTable_.data();
+	const unsigned int packW = packW_;
+	const unsigned int c0 = HFlip ? width_ - 4 * packW : 0;
 
-	auto quad = [&](const uint16_t *r0, const uint16_t *r1, unsigned int q) {
-		const unsigned int c = HFlip ? width - 2 - 2 * q : 2 * q;
-		return table[r0[c] >> kRawShift] + table[r0[c + 1] >> kRawShift] +
-		       table[r1[c] >> kRawShift] + table[r1[c + 1] >> kRawShift];
-	};
+	for (unsigned int y = 0; y < packH_; y++) {
+		const uint16_t *rows[4];
+		for (unsigned int dy = 0; dy < 4; ++dy)
+			rows[dy] = bayer16 + size_t(rawRow(4 * y + dy)) * stridePx + c0;
+		float *out = workCur_.data() + size_t(y) * packW;
 
-	std::fill(colCur_.begin(), colCur_.end(), 0.0f);
-	for (unsigned int p = 0; p < planeH; p++) {
-		const uint16_t *r0 = bayer16 + size_t(rawRow(2 * p)) * stridePx;
-		const uint16_t *r1 = bayer16 + size_t(rawRow(2 * p + 1)) * stridePx;
-		float sum = 0.0f;
-		if (motionX_ && profileRows_[p]) {
-			/* A row the column profile samples: read all of it. */
-			for (unsigned int q = 0; q < planeW; q++) {
-				const float v = quad(r0, r1, q);
-				colCur_[q] += v;
-				if (profileCols_[q])
-					sum += v;
+		unsigned int b = 0;
+#if defined(__ARM_NEON)
+		/* Four blocks at a time: pairwise sums widened to 32 bits, then pairs again. */
+		for (; b + 4 <= packW; b += 4) {
+			uint32x4_t lo = vdupq_n_u32(0), hi = vdupq_n_u32(0);
+			for (unsigned int dy = 0; dy < 4; ++dy) {
+				lo = vpadalq_u16(lo, vld1q_u16(rows[dy] + 4 * b));
+				hi = vpadalq_u16(hi, vld1q_u16(rows[dy] + 4 * b + 8));
 			}
-		} else if (motionY_) {
-			for (unsigned int q = motionX_; q < planeW - motionX_; q += step)
-				sum += quad(r0, r1, q);
+			float32x4_t v = vcvtq_f32_u32(vpaddq_u32(lo, hi));
+			if constexpr (HFlip) {
+				v = vrev64q_f32(v);
+				vst1q_f32(out + packW - 4 - b, vextq_f32(v, v, 2));
+			} else {
+				vst1q_f32(out + b, v);
+			}
 		}
-		if (motionY_)
-			rowCur_[p] = sum;
+#endif
+		for (; b < packW; b++) {
+			uint32_t sum = 0;
+			for (unsigned int dy = 0; dy < 4; ++dy)
+				for (unsigned int dx = 0; dx < 4; ++dx)
+					sum += rows[dy][4 * b + dx];
+			out[HFlip ? packW - 1 - b : b] = float(sum);
+		}
 	}
 }
 
 /*
- * Once the current frame's profiles are complete, estimate this frame's
- * motion against the previous result's, and set up the shift. Shifted, the
- * previous state is swapped into prevLast_ (prevFloatLast_) for the blend to
- * read, as it can't be updated in place. The previous result's profiles are
- * then cleared, for the blend to build again.
+ * Once the current frame's working image is complete, estimate this frame's
+ * motion against the previous result's (a translation, and with rotation_
+ * possibly a rotation), and set up the shift or rotation. Shifted or
+ * rotated, the previous state is swapped into prevLast_ (prevFloatLast_)
+ * for the blend to read, as it can't be updated in place.
+ *
+ * The motion is logged in the sensor's own orientation (raw pixels,
+ * degrees), not mirrored: mirroring an axis negates that axis's translation,
+ * and mirroring either one (but not both) negates the rotation.
  */
 void DenoiseBstm::estimateMotion()
 {
 	shiftX_ = shiftY_ = 0;
-	if (!firstFrame_ && prevProfilesValid_) {
-		std::ostringstream log;
-		/* Reported as raw pixels in the sensor's own orientation, not mirrored. */
-		auto report = [&](const char *axis, const MotionMatch &m, bool flip) {
-			log << " " << axis << " " << (flip ? -2 : 2) * m.best << " (confidence "
-			    << m.confidence << (m.rejected ? std::string(", ") + m.rejected + ": not used" : "")
-			    << ")";
-		};
-		if (motionX_) {
-			const MotionMatch m = matchProfiles(colCur_, colPrev_, motionX_,
-							    config_.motionThreshold);
-			shiftX_ = m.shift;
-			report("x", m, hflip_);
-		}
-		if (motionY_) {
-			const MotionMatch m = matchProfiles(rowCur_, rowPrev_, motionY_,
-							    config_.motionThreshold);
-			shiftY_ = m.shift;
-			report("y", m, vflip_);
-		}
-		LOG(RPiDenoiseBstm, Debug) << "Motion:" << log.str();
-	}
+	rotated_ = false;
+	shifted_ = false;
+	if (firstFrame_ || !workPrevValid_)
+		return;
 
-	shifted_ = shiftX_ || shiftY_;
+	const GlobalMotionResult m = estimateGlobalMotion(workCur_.data(), workPrev_.data(), packW_,
+							  packH_, packW_, globalMotion_);
+
+	static const char *kinds[] = { "none", "translation", "rotation" };
+	const double sx = hflip_ ? -4.0 : 4.0, sy = vflip_ ? -4.0 : 4.0;
+	std::ostringstream log;
+	log << "Motion: " << kinds[int(m.kind)] << " x " << sx * m.tx << " y " << sy * m.ty;
+	if (rotation_) {
+		const double sTheta = hflip_ != vflip_ ? -180.0 / M_PI : 180.0 / M_PI;
+		log << " degrees " << sTheta * m.theta;
+	}
+	log << ", costs none " << m.costNone << " translation " << m.costTranslation;
+	if (rotation_) {
+		log << " rotation " << m.costRotation;
+		if (*m.reason)
+			log << " (no rotation candidate: " << m.reason << ")";
+		log << ", scale " << m.scale;
+	}
+	for (unsigned int h = 0; h < 2; h++) {
+		/* The halves, as they lie in the raw frame. */
+		const GlobalMotionHalf &half = m.half[hflip_ ? 1 - h : h];
+		log << (h ? ", right" : ", left") << " x " << sx * half.dx << " y " << sy * half.dy
+		    << " (peaks " << half.peakX << ", " << half.peakY;
+		if (rotation_ && !half.centresOk)
+			log << ", geometric centres";
+		log << ")";
+	}
+	LOG(RPiDenoiseBstm, Debug) << log.str();
+
+	if (m.kind != GlobalMotionResult::Kind::None)
+		buildMotionMaps(m);
+
 	if (shifted_) {
-		buildShiftMap(shiftMapX_, packW_, shiftX_);
-		buildShiftMap(shiftMapY_, packH_, shiftY_);
 		if (isFloat_)
 			std::swap(prevFloat_, prevFloatLast_);
 		else
 			std::swap(prev_, prevLast_);
 	}
+}
 
-	std::fill(rowPrev_.begin(), rowPrev_.end(), 0.0f);
-	std::fill(colPrev_.begin(), colPrev_.end(), 0.0f);
+/*
+ * Set up the warp for an estimated motion: in plane pixels (quads, two per
+ * working pixel), measured from the frame's centre, output quad p reads the
+ * previous result at R^T (p - t). When the rotation moves no quad by half a
+ * quad or more (always, for a translation), it's a translation (rounded to
+ * whole quads) instead, with shiftMapX_/shiftMapY_; otherwise rotated_ is set,
+ * with rotationMap_. shifted_ is set if either moves anything.
+ */
+void DenoiseBstm::buildMotionMaps(const GlobalMotionResult &motion)
+{
+	const double tx = 2.0 * motion.tx, ty = 2.0 * motion.ty;
+	if (std::abs(motion.theta) * rotationRadius_ < 0.5) {
+		shiftX_ = int(std::lround(tx));
+		shiftY_ = int(std::lround(ty));
+		shifted_ = shiftX_ || shiftY_;
+		if (shifted_) {
+			buildShiftMap(shiftMapX_, packW_, shiftX_);
+			buildShiftMap(shiftMapY_, packH_, shiftY_);
+		}
+	} else {
+		buildRotationMap(rotationMap_, packW_, packH_, tx, ty, motion.theta);
+		rotated_ = shifted_ = true;
+	}
 }
 
 /*
@@ -1360,9 +1380,9 @@ void DenoiseBstm::estimateMotion()
  *
  * On a shifted frame, prev is read from the previous state (swapped into
  * prevLast_ or prevFloatLast_) where this frame's motion moved it from,
- * exactly as each tile's prev input was packed. With motion compensation,
- * out is also added to the profiles that the next frame's motion is
- * estimated against.
+ * (or rotated it from), exactly as each tile's prev input was packed. With
+ * motion compensation, out also makes the working image (workPrev_) that
+ * the next frame's motion is estimated against.
  *
  * int8 model: r and a are dequantised, (q - zero point) * scale, alpha comes
  * from alphaTable_, and the state is prev_ (16-bit fixed point), with
@@ -1390,8 +1410,8 @@ void DenoiseBstm::blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned in
 	uint16_t *prevBuf = prev_.data();
 	const uint16_t *prevLastBuf = prevLast_.data();
 	int8_t *prevQBuf = prevQ_.data();
-	const bool shifted = shifted_;
-	const bool profile = motionX_ || motionY_;
+	const bool shifted = shifted_, rotated = rotated_;
+	float *workBuf = motionX_ || motionY_ ? workPrev_.data() : nullptr;
 	const float rScale = rScale_;
 	const int rZp = rZp_;
 	const float prevInvScale = 1.0f / prevScale_;
@@ -1416,7 +1436,6 @@ void DenoiseBstm::blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned in
 		for (unsigned int dy = 0; dy < 4; ++dy)
 			rows[dy] = bayer16 + size_t(rawRow(4 * y + dy)) * stridePx;
 
-		float rowSum[2] = { 0.0f, 0.0f };
 		for (unsigned int x = x0; x < x1; ++x) {
 			const unsigned int col = blockColumn<HFlip>(width, x);
 			alignas(16) float xf[kChannels];
@@ -1424,9 +1443,10 @@ void DenoiseBstm::blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned in
 			uint16_t *p = pRow + size_t(x) * kChannels;
 			int8_t *pq = qRow + size_t(x) * kChannels;
 			alignas(16) uint16_t tmp[kChannels];
-			const uint16_t *ps = shifted ? shiftedPrev(prevLastBuf, packW, shiftMapY_, shiftMapX_,
-								   y, x, tmp)
-						     : p;
+			const uint16_t *ps =
+				!shifted  ? p
+				: rotated ? rotatedPrev(prevLastBuf, packW, rotationMap_, y, x, tmp)
+					  : shiftedPrev(prevLastBuf, packW, shiftMapY_, shiftMapX_, y, x, tmp);
 			const Cover cx = cover(tilesX_, x);
 
 			/* The covering tiles (1, 2 or 4), their weights and pixel offsets. */
@@ -1479,12 +1499,12 @@ void DenoiseBstm::blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned in
 			}
 			storePrev(p, out, vRawMax);
 			vst1q_s8(pq, quantisePrev(out, vPrevInvScale, vPrevZp));
-			if (profile) {
-				/* out.val[c] is Bayer plane c at the 4 quads (i, j), in i*2 + j order. */
-				alignas(16) float lum[4];
-				vst1q_f32(lum, vaddq_f32(vaddq_f32(out.val[0], out.val[1]),
-							 vaddq_f32(out.val[2], out.val[3])));
-				addProfiles(rowSum, colPrev_, y, x, lum);
+			if (workBuf) {
+				/* The next frame's working image: linear, as 16-bit raw values. */
+				float32x4_t sq = vmulq_f32(out.val[0], out.val[0]);
+				for (unsigned int i = 1; i < 4; ++i)
+					sq = vfmaq_f32(sq, out.val[i], out.val[i]);
+				workBuf[size_t(y) * packW + x] = 65535.0f * vaddvq_f32(sq);
 			}
 #else
 			float out[kChannels];
@@ -1507,19 +1527,17 @@ void DenoiseBstm::blendRegionInt8(unsigned int k, uint16_t *bayer16, unsigned in
 				pq[c] = int8_t(std::clamp(int(std::lround(out[c] * prevInvScale)) + prevZp,
 							  -128, 127));
 			}
-			if (profile) {
-				float lum[4];
-				for (unsigned int q = 0; q < 4; q++)
-					lum[q] = out[q] + out[4 + q] + out[8 + q] + out[12 + q];
-				addProfiles(rowSum, colPrev_, y, x, lum);
+			if (workBuf) {
+				float sq = 0.0f;
+				for (unsigned int c = 0; c < kChannels; ++c)
+					sq += out[c] * out[c];
+				workBuf[size_t(y) * packW + x] = 65535.0f * sq;
 			}
 #endif
 
 			if (x >= xBegin && x < xEnd)
 				writeRaw<HFlip>(rows, col, out);
 		}
-		if (profile)
-			addRowSums(rowPrev_, y, rowSum);
 	}
 }
 
@@ -1548,8 +1566,8 @@ void DenoiseBstm::blendRegionFloat(unsigned int k, uint16_t *bayer16, unsigned i
 	const float *xfTable = xfTable_.data();
 	float *prevBuf = prevFloat_.data();
 	const float *prevLastBuf = prevFloatLast_.data();
-	const bool shifted = shifted_;
-	const bool profile = motionX_ || motionY_;
+	const bool shifted = shifted_, rotated = rotated_;
+	float *workBuf = motionX_ || motionY_ ? workPrev_.data() : nullptr;
 
 #if defined(__ARM_NEON)
 	const float32x4_t vZero = vdupq_n_f32(0.0f);
@@ -1563,16 +1581,16 @@ void DenoiseBstm::blendRegionFloat(unsigned int k, uint16_t *bayer16, unsigned i
 		for (unsigned int dy = 0; dy < 4; ++dy)
 			rows[dy] = bayer16 + size_t(rawRow(4 * y + dy)) * stridePx;
 
-		float rowSum[2] = { 0.0f, 0.0f };
 		for (unsigned int x = x0; x < x1; ++x) {
 			const unsigned int col = blockColumn<HFlip>(width, x);
 			alignas(16) float xf[kChannels];
 			gatherSqrt<HFlip>(rows, col, xfTable, xf);
 			float *p = pRow + size_t(x) * kChannels;
 			alignas(16) float tmp[kChannels];
-			const float *ps = shifted ? shiftedPrev(prevLastBuf, packW, shiftMapY_, shiftMapX_,
-								y, x, tmp)
-						  : p;
+			const float *ps =
+				!shifted  ? p
+				: rotated ? rotatedPrev(prevLastBuf, packW, rotationMap_, y, x, tmp)
+					  : shiftedPrev(prevLastBuf, packW, shiftMapY_, shiftMapX_, y, x, tmp);
 			const Cover cx = cover(tilesX_, x);
 
 			unsigned int nt = 0, tile[4];
@@ -1622,11 +1640,12 @@ void DenoiseBstm::blendRegionFloat(unsigned int k, uint16_t *bayer16, unsigned i
 					out.val[i] = first ? acc.val[i] : vaddq_f32(pv.val[i], acc.val[i]);
 			}
 			vst1q_f32_x4(p, out);
-			if (profile) {
-				alignas(16) float lum[4];
-				vst1q_f32(lum, vaddq_f32(vaddq_f32(out.val[0], out.val[1]),
-							 vaddq_f32(out.val[2], out.val[3])));
-				addProfiles(rowSum, colPrev_, y, x, lum);
+			if (workBuf) {
+				/* The next frame's working image: linear, as 16-bit raw values. */
+				float32x4_t sq = vmulq_f32(out.val[0], out.val[0]);
+				for (unsigned int i = 1; i < 4; ++i)
+					sq = vfmaq_f32(sq, out.val[i], out.val[i]);
+				workBuf[size_t(y) * packW + x] = 65535.0f * vaddvq_f32(sq);
 			}
 #else
 			float out[kChannels];
@@ -1647,19 +1666,17 @@ void DenoiseBstm::blendRegionFloat(unsigned int k, uint16_t *bayer16, unsigned i
 				out[c] = nt == 1 || first ? acc : pc + acc;
 			}
 			std::copy(out, out + kChannels, p);
-			if (profile) {
-				float lum[4];
-				for (unsigned int q = 0; q < 4; q++)
-					lum[q] = out[q] + out[4 + q] + out[8 + q] + out[12 + q];
-				addProfiles(rowSum, colPrev_, y, x, lum);
+			if (workBuf) {
+				float sq = 0.0f;
+				for (unsigned int c = 0; c < kChannels; ++c)
+					sq += out[c] * out[c];
+				workBuf[size_t(y) * packW + x] = 65535.0f * sq;
 			}
 #endif
 
 			if (x >= xBegin && x < xEnd)
 				writeRaw<HFlip>(rows, col, out);
 		}
-		if (profile)
-			addRowSums(rowPrev_, y, rowSum);
 	}
 }
 
@@ -1758,17 +1775,17 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 
 	/*
 	 * With motion compensation, every tile's prev input depends on the
-	 * motion, so it's estimated first, from (subsampled) profiles read
-	 * straight from the raw frame; then tiles are packed and handed to the
-	 * inference thread one by one, as before.
+	 * motion, so it's estimated first, from a working image read straight
+	 * from the raw frame; then tiles are packed and handed to the inference
+	 * thread one by one, as before.
 	 */
 	double motionMs = 0.0;
 	if (motionX_ || motionY_) {
 		const Clock::time_point tm = Clock::now();
 		if (hflip_)
-			profileFrame<true>(bayer16, stridePx);
+			workFrame<true>(bayer16, stridePx);
 		else
-			profileFrame<false>(bayer16, stridePx);
+			workFrame<false>(bayer16, stridePx);
 		estimateMotion();
 		motionMs = msSince(tm);
 	}
@@ -1806,9 +1823,12 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 	const double tailMs = msSince(tLast);
 
 	double npuMs;
+	Clock::time_point npuFirstStart, npuLastEnd;
 	{
 		std::lock_guard<std::mutex> lock(npuMutex_);
 		npuMs = npuMs_;
+		npuFirstStart = npuFirstStart_;
+		npuLastEnd = npuLastEnd_;
 	}
 
 	if (!ok) {
@@ -1818,7 +1838,7 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 		return;
 	}
 	firstFrame_ = false;
-	prevProfilesValid_ = motionX_ || motionY_;
+	workPrevValid_ = motionX_ || motionY_;
 
 	if (dump) {
 		dumpFrame(bayer16, stridePx, "out");
@@ -1829,11 +1849,23 @@ void DenoiseBstm::prepare(Metadata *imageMetadata)
 	dmabufSyncEnd(bayer.first);
 	const double syncEndMs = msSince(tEnd);
 
+	/*
+	 * The frame's critical path: until the NPU starts the first tile, the
+	 * NPU running all the tiles (with any gaps where it waits for packing),
+	 * and everything after the last tile (blending its region and syncing
+	 * the buffer).
+	 */
+	const Clock::time_point tDone = Clock::now();
+	auto ms = [](Clock::time_point a, Clock::time_point b) {
+		return std::chrono::duration<double, std::milli>(b - a).count();
+	};
 	LOG(RPiDenoiseBstm, Debug)
-		<< "sync " << syncStartMs << " + " << syncEndMs << " ms, pack " << packMs
+		<< "before NPU " << ms(tStart, npuFirstStart) << " ms, NPU span "
+		<< ms(npuFirstStart, npuLastEnd) << " ms, after NPU " << ms(npuLastEnd, tDone)
+		<< " ms; sync " << syncStartMs << " + " << syncEndMs << " ms, pack " << packMs
 		<< " ms, motion " << motionMs << " ms, network " << npuMs << " ms (" << nTiles << " tiles), waiting " << waitMs
 		<< " ms, blend " << blendMs << " ms (last tile " << tailMs << " ms), total "
-		<< msSince(tStart) << " ms";
+		<< ms(tStart, tDone) << " ms";
 
 	/*
 	 * The classic stages' noise thresholds scale with the noise model's
